@@ -1,4 +1,4 @@
-name: MTK Logo
+name: MTK Logo PoC Build + Cert Bypass Pipeline
 
 on:
   push:
@@ -17,17 +17,11 @@ on:
         type: choice
         options: [white, black, red, green, blue]
       bypass_mode:
-        description: 'Certificate bypass mode'
+        description: 'Certificate bypass mode (applied to ALL generated logo.bin)'
         required: true
         default: 'override'
         type: choice
         options: [override, wrap]
-      patch_set:
-        description: 'Which PoC set to patch'
-        required: true
-        default: 'all'
-        type: choice
-        options: [all, critical, size_only, none]
 
 permissions:
   contents: read
@@ -43,7 +37,7 @@ env:
 
 jobs:
   pipeline:
-    name: Build PoC -> cert bypass -> zip
+    name: Build PoC -> cert bypass (all) -> zip
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
@@ -90,8 +84,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python "${{ steps.tool.outputs.path }}" info         "${INPUT_LOGO}" > "${OUT_DIR}/info.txt"
-          python "${{ steps.tool.outputs.path }}" data_hex     "${INPUT_LOGO}" 0 0x100 > "${OUT_DIR}/data_hex.txt"
+          python "${{ steps.tool.outputs.path }}" info          "${INPUT_LOGO}" > "${OUT_DIR}/info.txt"
+          python "${{ steps.tool.outputs.path }}" data_hex      "${INPUT_LOGO}" 0 0x100 > "${OUT_DIR}/data_hex.txt"
           python "${{ steps.tool.outputs.path }}" data_bmp_check "${INPUT_LOGO}" > "${OUT_DIR}/data_bmp_check.txt"
           cat "${OUT_DIR}/info.txt"
 
@@ -120,63 +114,35 @@ jobs:
           python -m pip install git+https://github.com/R0rt1z2/lkpatcher
           python -m lkpatcher --help 2>&1 | tee "${ARTIFACT_DIR}/lkpatcher_help.txt" || true
 
-      - name: Enumerate PoC targets by patch_set
-        id: targets
-        shell: bash
-        env:
-          PATCH_SET: ${{ inputs.patch_set || 'all' }}
-        run: |
-          set -euo pipefail
-          : > "${ARTIFACT_DIR}/patch_targets.txt"
-          case "${PATCH_SET}" in
-            all)
-              for f in "${OUT_DIR}"/*.bin; do
-                [ "$(basename "$f")" = "logo_original.bin" ] && continue
-                echo "$f" >> "${ARTIFACT_DIR}/patch_targets.txt"
-              done
-              ;;
-            critical)
-              for kind in rle_attack rle_zero rle_255 size_huge size_zero \
-                          combo_huge_ff combo_huge_rle combo_zero_ff \
-                          random fill_ff fill_00; do
-                [ -f "${OUT_DIR}/logo_${kind}.bin" ] && \
-                  echo "${OUT_DIR}/logo_${kind}.bin" >> "${ARTIFACT_DIR}/patch_targets.txt"
-              done
-              ;;
-            size_only)
-              for kind in size_huge size_zero size_plus1 size_minus1 size_half size_boundary; do
-                [ -f "${OUT_DIR}/logo_${kind}.bin" ] && \
-                  echo "${OUT_DIR}/logo_${kind}.bin" >> "${ARTIFACT_DIR}/patch_targets.txt"
-              done
-              ;;
-            none)
-              :
-              ;;
-            *)
-              echo "::error::unknown patch_set ${PATCH_SET}"; exit 1 ;;
-          esac
-          count=$(wc -l < "${ARTIFACT_DIR}/patch_targets.txt")
-          echo "count=${count}" >> "$GITHUB_OUTPUT"
-          echo "targets: ${count}"
-          head -100 "${ARTIFACT_DIR}/patch_targets.txt"
-
-      - name: Apply cert bypass to each target
-        if: ${{ steps.targets.outputs.count != '0' }}
+      - name: Apply cert bypass to ALL generated logo.bin
         shell: bash
         env:
           BYPASS_MODE: ${{ inputs.bypass_mode || 'override' }}
         run: |
           set -euo pipefail
+          : > "${ARTIFACT_DIR}/patch_targets.txt"
           : > "${ARTIFACT_DIR}/patch_results.txt"
           : > "${ARTIFACT_DIR}/failures.txt"
+
+          # Enumerate every generated logo.bin (skip the untouched original copy)
+          for f in "${OUT_DIR}"/*.bin; do
+            [ -e "$f" ] || continue
+            [ "$(basename "$f")" = "logo_original.bin" ] && continue
+            echo "$f" >> "${ARTIFACT_DIR}/patch_targets.txt"
+          done
+
+          total=$(wc -l < "${ARTIFACT_DIR}/patch_targets.txt")
+          echo "targets: ${total}"
+
           ok=0; fail=0
           while IFS= read -r f; do
+            [ -e "$f" ] || continue
             name=$(basename "$f" .bin)
             out="${PATCHED_DIR}/${name}_patched.img"
             echo "=== ${name} (mode=${BYPASS_MODE}) ===" | tee -a "${ARTIFACT_DIR}/patch_results.txt"
             if python -m lkpatcher "$f" \
                  -o "$out" \
-                 --cert-bypass "$BYPASS_MODE" \
+                 --cert-bypass "${BYPASS_MODE}" \
                  >> "${ARTIFACT_DIR}/patch_results.txt" 2>&1; then
               echo "OK   ${name} -> $(stat -c%s "$out") bytes" \
                 | tee -a "${ARTIFACT_DIR}/patch_results.txt"
@@ -188,24 +154,30 @@ jobs:
               fail=$((fail+1))
             fi
           done < "${ARTIFACT_DIR}/patch_targets.txt"
-          echo "patched ok=${ok} failed=${fail}"
-          echo "ok=${ok}"     >> "${ARTIFACT_DIR}/patch_summary.txt"
-          echo "fail=${fail}" >> "${ARTIFACT_DIR}/patch_summary.txt"
+
+          echo "patched total=${total} ok=${ok} failed=${fail}"
+          {
+            echo "total=${total}"
+            echo "ok=${ok}"
+            echo "fail=${fail}"
+          } > "${ARTIFACT_DIR}/patch_summary.txt"
+
           if [ "$ok" -eq 0 ] && [ "$fail" -gt 0 ]; then
             echo "::warning::lkpatcher failed on ALL targets (see failures.txt). Unpatched PoCs will still be packaged."
           fi
 
       - name: Verify patched outputs
-        if: ${{ steps.targets.outputs.count != '0' }}
         shell: bash
         run: |
           set -euo pipefail
           shopt -s nullglob
+          : > "${ARTIFACT_DIR}/patched_inventory.txt"
           for f in "${PATCHED_DIR}"/*_patched.img; do
             size=$(stat -c%s "$f")
             sha=$(sha256sum "$f" | cut -c1-16)
-            echo "${f} size=${size} sha256[0:16]=${sha}"
-          done | tee "${ARTIFACT_DIR}/patched_inventory.txt"
+            echo "${f} size=${size} sha256[0:16]=${sha}" \
+              | tee -a "${ARTIFACT_DIR}/patched_inventory.txt"
+          done
 
       - name: Populate artifact dir
         shell: bash
@@ -219,10 +191,12 @@ jobs:
             echo "# MTK logo PoC + cert bypass artifact"
             echo "- bypass_mode: ${{ inputs.bypass_mode || 'override' }}"
             echo "- color      : ${{ inputs.color || 'white' }}"
-            echo "- patch_set  : ${{ inputs.patch_set || 'all' }}"
             echo "- commit     : ${{ github.sha }}"
             echo "- branch     : ${{ github.ref_name }}"
             echo "- repo       : ${{ github.repository }}"
+            echo
+            echo "cert2 bypass on LK and logo share the same mechanism;"
+            echo "all generated logo.bin were patched via lkpatcher --cert-bypass."
             echo
             cat "${ARTIFACT_DIR}/patch_summary.txt" 2>/dev/null || true
           } > "${ARTIFACT_DIR}/README.md"
@@ -258,12 +232,16 @@ jobs:
             echo
             echo "- **Bypass mode**: \`${{ inputs.bypass_mode || 'override' }}\`"
             echo "- **Color**: \`${{ inputs.color || 'white' }}\`"
-            echo "- **Patch set**: \`${{ inputs.patch_set || 'all' }}\`"
-            echo "- **Targets**: ${{ steps.targets.outputs.count }}"
+            echo "- **Targets**: $(wc -l < "${ARTIFACT_DIR}/patch_targets.txt" 2>/dev/null || echo 0)"
             echo
             echo "#### Patch results"
             echo '```'
             cat "${ARTIFACT_DIR}/patch_summary.txt" 2>/dev/null || true
+            echo '```'
+            echo
+            echo "#### Failures (expected for header/magic corruption PoCs)"
+            echo '```'
+            cat "${ARTIFACT_DIR}/failures.txt" 2>/dev/null || true
             echo '```'
             echo
             echo "#### Artifact contents"

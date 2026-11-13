@@ -15,9 +15,9 @@ on:
         description: Size of the generated ext4 image in GiB
         required: true
         type: choice
-        default: "1"
+        default: "2"
         options:
-          - "1"
+          - "2"
           - "3"
           - "4"
           - "6"

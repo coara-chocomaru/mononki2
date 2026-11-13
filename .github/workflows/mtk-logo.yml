@@ -1,21 +1,33 @@
-name: mtk-logo-poc
+name: MTK Logo
 
 on:
   push:
     branches: [ main, master ]
     paths:
       - 'input/logo.bin'
-      - 'logo_poc.py'
+      - 'logo_tool.py'
       - 'scripts/logo_tool.py'
       - '.github/workflows/mtk-logo.yml'
   workflow_dispatch:
     inputs:
       color:
-        description: 'RGB565 fill color for replace_raw'
+        description: 'RGB565 fill color for raw variants'
         required: true
         default: 'white'
         type: choice
         options: [white, black, red, green, blue]
+      bypass_mode:
+        description: 'Certificate bypass mode'
+        required: true
+        default: 'override'
+        type: choice
+        options: [override, wrap]
+      patch_set:
+        description: 'Which PoC set to patch'
+        required: true
+        default: 'all'
+        type: choice
+        options: [all, critical, size_only, none]
 
 permissions:
   contents: read
@@ -26,21 +38,27 @@ env:
   TOOL_1: 'logo_tool.py'
   TOOL_2: 'scripts/logo_tool.py'
   OUT_DIR: 'out'
+  PATCHED_DIR: 'patched'
+  ARTIFACT_DIR: 'artifact'
 
 jobs:
-  build:
+  pipeline:
+    name: Build PoC -> cert bypass -> zip
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 60
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
-      - uses: actions/setup-python@v5
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: resolve tool
+      - name: Resolve tool path
         id: tool
         shell: bash
         run: |
@@ -54,7 +72,7 @@ jobs:
             exit 1
           fi
 
-      - name: verify
+      - name: Verify inputs
         shell: bash
         run: |
           set -euo pipefail
@@ -62,40 +80,28 @@ jobs:
           python -m py_compile "${{ steps.tool.outputs.path }}"
           sha256sum "${INPUT_LOGO}" | tee "${INPUT_LOGO}.sha256"
 
-      - name: mkdir out
-        run: mkdir -p "${OUT_DIR}"
-
-      - name: info
+      - name: Create dirs
         shell: bash
         run: |
           set -euo pipefail
-          python "${{ steps.tool.outputs.path }}" info "${INPUT_LOGO}" \
-            > "${OUT_DIR}/info.txt"
+          mkdir -p "${OUT_DIR}" "${PATCHED_DIR}" "${ARTIFACT_DIR}"
+
+      - name: Info & data structure probes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python "${{ steps.tool.outputs.path }}" info         "${INPUT_LOGO}" > "${OUT_DIR}/info.txt"
+          python "${{ steps.tool.outputs.path }}" data_hex     "${INPUT_LOGO}" 0 0x100 > "${OUT_DIR}/data_hex.txt"
+          python "${{ steps.tool.outputs.path }}" data_bmp_check "${INPUT_LOGO}" > "${OUT_DIR}/data_bmp_check.txt"
           cat "${OUT_DIR}/info.txt"
 
-      - name: data_hex (first 0x100)
-        shell: bash
-        run: |
-          set -euo pipefail
-          python "${{ steps.tool.outputs.path }}" data_hex "${INPUT_LOGO}" 0 0x100 \
-            > "${OUT_DIR}/data_hex.txt"
-          cat "${OUT_DIR}/data_hex.txt"
-
-      - name: data_bmp_check
-        shell: bash
-        run: |
-          set -euo pipefail
-          python "${{ steps.tool.outputs.path }}" data_bmp_check "${INPUT_LOGO}" \
-            > "${OUT_DIR}/data_bmp_check.txt"
-          cat "${OUT_DIR}/data_bmp_check.txt"
-
-      - name: generate ALL PoC variants
+      - name: Generate ALL PoC variants
         shell: bash
         run: |
           set -euo pipefail
           python "${{ steps.tool.outputs.path }}" all "${INPUT_LOGO}" "${OUT_DIR}"
 
-      - name: replace_raw white (valid-size RGB565)
+      - name: Generate raw variants (RGB565 full + keep size)
         shell: bash
         env:
           COLOR: ${{ inputs.color || 'white' }}
@@ -103,49 +109,165 @@ jobs:
           set -euo pipefail
           python "${{ steps.tool.outputs.path }}" replace_raw \
             "${INPUT_LOGO}" 1280 800 "${OUT_DIR}/logo_raw_${COLOR}_full.bin" "${COLOR}"
-
-      - name: replace_raw white (keep original body size)
-        shell: bash
-        env:
-          COLOR: ${{ inputs.color || 'white' }}
-        run: |
-          set -euo pipefail
           python "${{ steps.tool.outputs.path }}" replace_raw \
             "${INPUT_LOGO}" 1280 800 "${OUT_DIR}/logo_raw_${COLOR}_keep.bin" "${COLOR}" 1
 
-      - name: inventory
+      - name: Install lkpatcher
         shell: bash
         run: |
           set -euo pipefail
-          ls -l "${OUT_DIR}"
-          sha256sum "${OUT_DIR}"/*.bin > "${OUT_DIR}/SHA256SUMS.txt"
-          cat "${OUT_DIR}/SHA256SUMS.txt"
+          python -m pip install --upgrade pip
+          python -m pip install git+https://github.com/R0rt1z2/lkpatcher
+          python -m lkpatcher --help 2>&1 | tee "${ARTIFACT_DIR}/lkpatcher_help.txt" || true
 
-      - name: summary
+      - name: Enumerate PoC targets by patch_set
+        id: targets
+        shell: bash
+        env:
+          PATCH_SET: ${{ inputs.patch_set || 'all' }}
+        run: |
+          set -euo pipefail
+          : > "${ARTIFACT_DIR}/patch_targets.txt"
+          case "${PATCH_SET}" in
+            all)
+              for f in "${OUT_DIR}"/*.bin; do
+                [ "$(basename "$f")" = "logo_original.bin" ] && continue
+                echo "$f" >> "${ARTIFACT_DIR}/patch_targets.txt"
+              done
+              ;;
+            critical)
+              for kind in rle_attack rle_zero rle_255 size_huge size_zero \
+                          combo_huge_ff combo_huge_rle combo_zero_ff \
+                          random fill_ff fill_00; do
+                [ -f "${OUT_DIR}/logo_${kind}.bin" ] && \
+                  echo "${OUT_DIR}/logo_${kind}.bin" >> "${ARTIFACT_DIR}/patch_targets.txt"
+              done
+              ;;
+            size_only)
+              for kind in size_huge size_zero size_plus1 size_minus1 size_half size_boundary; do
+                [ -f "${OUT_DIR}/logo_${kind}.bin" ] && \
+                  echo "${OUT_DIR}/logo_${kind}.bin" >> "${ARTIFACT_DIR}/patch_targets.txt"
+              done
+              ;;
+            none)
+              :
+              ;;
+            *)
+              echo "::error::unknown patch_set ${PATCH_SET}"; exit 1 ;;
+          esac
+          count=$(wc -l < "${ARTIFACT_DIR}/patch_targets.txt")
+          echo "count=${count}" >> "$GITHUB_OUTPUT"
+          echo "targets: ${count}"
+          head -100 "${ARTIFACT_DIR}/patch_targets.txt"
+
+      - name: Apply cert bypass to each target
+        if: ${{ steps.targets.outputs.count != '0' }}
+        shell: bash
+        env:
+          BYPASS_MODE: ${{ inputs.bypass_mode || 'override' }}
+        run: |
+          set -euo pipefail
+          : > "${ARTIFACT_DIR}/patch_results.txt"
+          : > "${ARTIFACT_DIR}/failures.txt"
+          ok=0; fail=0
+          while IFS= read -r f; do
+            name=$(basename "$f" .bin)
+            out="${PATCHED_DIR}/${name}_patched.img"
+            echo "=== ${name} (mode=${BYPASS_MODE}) ===" | tee -a "${ARTIFACT_DIR}/patch_results.txt"
+            if python -m lkpatcher "$f" \
+                 -o "$out" \
+                 --cert-bypass "$BYPASS_MODE" \
+                 >> "${ARTIFACT_DIR}/patch_results.txt" 2>&1; then
+              echo "OK   ${name} -> $(stat -c%s "$out") bytes" \
+                | tee -a "${ARTIFACT_DIR}/patch_results.txt"
+              ok=$((ok+1))
+            else
+              echo "FAIL ${name}" \
+                | tee -a "${ARTIFACT_DIR}/patch_results.txt" \
+                | tee -a "${ARTIFACT_DIR}/failures.txt"
+              fail=$((fail+1))
+            fi
+          done < "${ARTIFACT_DIR}/patch_targets.txt"
+          echo "patched ok=${ok} failed=${fail}"
+          echo "ok=${ok}"     >> "${ARTIFACT_DIR}/patch_summary.txt"
+          echo "fail=${fail}" >> "${ARTIFACT_DIR}/patch_summary.txt"
+          if [ "$ok" -eq 0 ] && [ "$fail" -gt 0 ]; then
+            echo "::warning::lkpatcher failed on ALL targets (see failures.txt). Unpatched PoCs will still be packaged."
+          fi
+
+      - name: Verify patched outputs
+        if: ${{ steps.targets.outputs.count != '0' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for f in "${PATCHED_DIR}"/*_patched.img; do
+            size=$(stat -c%s "$f")
+            sha=$(sha256sum "$f" | cut -c1-16)
+            echo "${f} size=${size} sha256[0:16]=${sha}"
+          done | tee "${ARTIFACT_DIR}/patched_inventory.txt"
+
+      - name: Populate artifact dir
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp "${OUT_DIR}"/*.bin              "${ARTIFACT_DIR}/" 2>/dev/null || true
+          cp "${OUT_DIR}"/*.txt              "${ARTIFACT_DIR}/" 2>/dev/null || true
+          cp "${PATCHED_DIR}"/*_patched.img  "${ARTIFACT_DIR}/" 2>/dev/null || true
+          cp "${INPUT_LOGO}.sha256"          "${ARTIFACT_DIR}/" 2>/dev/null || true
+          {
+            echo "# MTK logo PoC + cert bypass artifact"
+            echo "- bypass_mode: ${{ inputs.bypass_mode || 'override' }}"
+            echo "- color      : ${{ inputs.color || 'white' }}"
+            echo "- patch_set  : ${{ inputs.patch_set || 'all' }}"
+            echo "- commit     : ${{ github.sha }}"
+            echo "- branch     : ${{ github.ref_name }}"
+            echo "- repo       : ${{ github.repository }}"
+            echo
+            cat "${ARTIFACT_DIR}/patch_summary.txt" 2>/dev/null || true
+          } > "${ARTIFACT_DIR}/README.md"
+          sha256sum "${ARTIFACT_DIR}"/* > "${ARTIFACT_DIR}/SHA256SUMS.txt" 2>/dev/null || true
+          ls -la "${ARTIFACT_DIR}"
+
+      - name: Build ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          zip_name="logo-poc-with-cert-bypass.zip"
+          ( cd "${ARTIFACT_DIR}" && zip -r "../${zip_name}" . )
+          ls -la "${zip_name}"
+          sha256sum "${zip_name}" | tee "${zip_name}.sha256"
+          echo "zip_name=${zip_name}" >> "$GITHUB_ENV"
+
+      - name: Upload ZIP artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: logo-poc-cert-bypass
+          path: |
+            ${{ env.zip_name }}
+            ${{ env.zip_name }}.sha256
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Job summary
         shell: bash
         run: |
           set -euo pipefail
           {
-            echo "### MTK logo PoC artifacts"
+            echo "### MTK Logo PoC + Cert Bypass"
             echo
-            echo "| file | size | sha256[0:16] |"
-            echo "|---|---|---|"
-            for f in "${OUT_DIR}"/*.bin; do
-              s=$(stat -c%s "${f}")
-              h=$(sha256sum "${f}" | cut -c1-16)
-              echo "| $(basename "${f}") | ${s} | ${h} |"
-            done
+            echo "- **Bypass mode**: \`${{ inputs.bypass_mode || 'override' }}\`"
+            echo "- **Color**: \`${{ inputs.color || 'white' }}\`"
+            echo "- **Patch set**: \`${{ inputs.patch_set || 'all' }}\`"
+            echo "- **Targets**: ${{ steps.targets.outputs.count }}"
+            echo
+            echo "#### Patch results"
+            echo '```'
+            cat "${ARTIFACT_DIR}/patch_summary.txt" 2>/dev/null || true
+            echo '```'
+            echo
+            echo "#### Artifact contents"
+            echo '```'
+            ls -la "${ARTIFACT_DIR}" || true
+            echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: logo-poc
-          path: |
-            ${{ env.OUT_DIR }}/*.bin
-            ${{ env.OUT_DIR }}/SHA256SUMS.txt
-            ${{ env.OUT_DIR }}/info.txt
-            ${{ env.OUT_DIR }}/data_hex.txt
-            ${{ env.OUT_DIR }}/data_bmp_check.txt
-            ${{ env.INPUT_LOGO }}.sha256
-          retention-days: 30
-          if-no-files-found: error

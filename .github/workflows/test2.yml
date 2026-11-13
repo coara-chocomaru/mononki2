@@ -1,0 +1,396 @@
+name: Build Ubuntu ARM64 Desktop RootFS
+
+on:
+  workflow_dispatch:
+    inputs:
+      ubuntu_suite:
+        description: Ubuntu LTS release for the ARM64 Desktop RootFS
+        required: true
+        type: choice
+        default: noble
+        options:
+          - noble
+          - jammy
+      ext4_size_gib:
+        description: Size of the generated ext4 image in GiB
+        required: true
+        type: choice
+        default: "6"
+        options:
+          - "4"
+          - "6"
+          - "8"
+          - "12"
+          - "16"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ubuntu-arm64-desktop-rootfs-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-desktop-rootfs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      UBUNTU_SUITE: ${{ inputs.ubuntu_suite }}
+      EXT4_SIZE_GIB: ${{ inputs.ext4_size_gib }}
+      ROOTFS_DIR: ${{ runner.temp }}/ubuntu-arm64-desktop-rootfs
+      IMAGE_MOUNT: ${{ runner.temp }}/ubuntu-arm64-desktop-image-mount
+      OUTPUT_DIR: ${{ github.workspace }}/out
+      ROOTFS_NAME: ubuntu-${{ inputs.ubuntu_suite }}-arm64-desktop-rootfs
+    steps:
+      - name: Install RootFS build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            binfmt-support \
+            debootstrap \
+            e2fsprogs \
+            file \
+            qemu-user-static \
+            zstd
+          test -x /usr/bin/qemu-aarch64-static
+          if ! mountpoint -q /proc/sys/fs/binfmt_misc; then
+            sudo mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc
+          fi
+          sudo systemctl restart systemd-binfmt.service || true
+          if [ ! -e /proc/sys/fs/binfmt_misc/qemu-aarch64 ]; then
+            sudo update-binfmts --enable qemu-aarch64
+          fi
+          test -e /proc/sys/fs/binfmt_misc/qemu-aarch64
+          mkdir -p "$OUTPUT_DIR"
+          df -h "$RUNNER_TEMP" "$GITHUB_WORKSPACE"
+
+      - name: Bootstrap Ubuntu ARM64 base system
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$UBUNTU_SUITE" in
+            jammy|noble) ;;
+            *) printf 'Unsupported Ubuntu suite: %s\n' "$UBUNTU_SUITE" >&2; exit 1 ;;
+          esac
+          case "$EXT4_SIZE_GIB" in
+            4|6|8|12|16) ;;
+            *) printf 'Unsupported ext4 image size: %s\n' "$EXT4_SIZE_GIB" >&2; exit 1 ;;
+          esac
+          sudo rm -rf "$ROOTFS_DIR" "$IMAGE_MOUNT"
+          sudo mkdir -p "$ROOTFS_DIR" "$IMAGE_MOUNT"
+          mkdir -p "$OUTPUT_DIR"
+          sudo debootstrap \
+            --arch=arm64 \
+            --foreign \
+            --variant=minbase \
+            --components=main,universe \
+            --include=apt,bash,ca-certificates,locales \
+            "$UBUNTU_SUITE" \
+            "$ROOTFS_DIR" \
+            https://ports.ubuntu.com/ubuntu-ports
+          sudo cp /usr/bin/qemu-aarch64-static "$ROOTFS_DIR/usr/bin/qemu-aarch64-static"
+
+      - name: Complete ARM64 bootstrap and install Desktop packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          cleanup_rootfs_mounts() {
+            set +e
+            if mountpoint -q "$ROOTFS_DIR/dev/pts"; then sudo umount "$ROOTFS_DIR/dev/pts"; fi
+            if mountpoint -q "$ROOTFS_DIR/sys"; then sudo umount "$ROOTFS_DIR/sys"; fi
+            if mountpoint -q "$ROOTFS_DIR/proc"; then sudo umount "$ROOTFS_DIR/proc"; fi
+            if mountpoint -q "$ROOTFS_DIR/dev"; then sudo umount "$ROOTFS_DIR/dev"; fi
+          }
+          trap cleanup_rootfs_mounts EXIT
+          sudo mount --bind /dev "$ROOTFS_DIR/dev"
+          sudo mount --bind /dev/pts "$ROOTFS_DIR/dev/pts"
+          sudo mount -t proc proc "$ROOTFS_DIR/proc"
+          sudo mount -t sysfs sysfs "$ROOTFS_DIR/sys"
+          if [ -f /etc/resolv.conf ]; then
+            sudo cp -L /etc/resolv.conf "$ROOTFS_DIR/etc/resolv.conf"
+          fi
+          printf '%s\n' '#!/bin/sh' 'exit 101' | sudo tee "$ROOTFS_DIR/usr/sbin/policy-rc.d" >/dev/null
+          sudo chmod 755 "$ROOTFS_DIR/usr/sbin/policy-rc.d"
+          sudo chroot "$ROOTFS_DIR" /debootstrap/debootstrap --second-stage
+          sudo chroot "$ROOTFS_DIR" /usr/bin/env DEBIAN_FRONTEND=noninteractive apt-get update
+          sudo chroot "$ROOTFS_DIR" /usr/bin/env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            bash \
+            bash-completion \
+            ca-certificates \
+            coreutils \
+            curl \
+            desktop-file-utils \
+            file \
+            findutils \
+            grep \
+            gzip \
+            hostname \
+            iproute2 \
+            iputils-ping \
+            kmod \
+            less \
+            locales \
+            nano \
+            net-tools \
+            procps \
+            psmisc \
+            sed \
+            shared-mime-info \
+            tar \
+            tzdata \
+            unzip \
+            util-linux \
+            vim-tiny \
+            wget \
+            xz-utils \
+            zstd \
+            xserver-xorg-core \
+            xserver-xorg-video-fbdev \
+            xserver-xorg-input-evdev \
+            xkb-data \
+            xauth \
+            dbus \
+            dbus-x11 \
+            xfce4-session \
+            xfce4-panel \
+            xfdesktop4 \
+            xfwm4 \
+            xfce4-settings \
+            xfconf \
+            xfce4-appfinder \
+            thunar \
+            xfce4-terminal \
+            openbox \
+            onboard \
+            onboard-data \
+            fonts-dejavu-core \
+            fonts-noto-cjk \
+            fonts-noto-color-emoji \
+            xfonts-base \
+            adwaita-icon-theme \
+            hicolor-icon-theme \
+            elementary-xfce-icon-theme \
+            greybird-gtk-theme \
+            gtk2-engines-murrine \
+            librsvg2-common \
+            xdg-utils \
+            x11-utils \
+            x11-xserver-utils \
+            libgl1-mesa-dri \
+            libegl-mesa0 \
+            libglx-mesa0 \
+            libgbm1 \
+            mesa-utils
+          sudo chroot "$ROOTFS_DIR" /usr/bin/env DEBIAN_FRONTEND=noninteractive apt-get clean
+          sudo rm -rf "$ROOTFS_DIR/var/lib/apt/lists/"* "$ROOTFS_DIR/var/cache/apt/archives/"* "$ROOTFS_DIR/tmp/"* "$ROOTFS_DIR/var/tmp/"*
+          sudo rm -f "$ROOTFS_DIR/usr/sbin/policy-rc.d"
+          sudo rm -f "$ROOTFS_DIR/etc/machine-id" "$ROOTFS_DIR/var/lib/dbus/machine-id"
+          sudo install -m 0644 /dev/null "$ROOTFS_DIR/etc/machine-id"
+          printf '%s\n' 'ubuntu-desktop' | sudo tee "$ROOTFS_DIR/etc/hostname" >/dev/null
+          printf '%s\n' \
+            '127.0.0.1 localhost' \
+            '127.0.1.1 ubuntu-desktop' \
+            '::1 localhost ip6-localhost ip6-loopback' | sudo tee "$ROOTFS_DIR/etc/hosts" >/dev/null
+          printf '%s\n' 'LANG=C.UTF-8' 'LC_ALL=C.UTF-8' | sudo tee "$ROOTFS_DIR/etc/default/locale" >/dev/null
+          printf '%s\n' 'Etc/UTC' | sudo tee "$ROOTFS_DIR/etc/timezone" >/dev/null
+          sudo ln -snf /usr/share/zoneinfo/Etc/UTC "$ROOTFS_DIR/etc/localtime"
+          sudo chmod 1777 "$ROOTFS_DIR/tmp" "$ROOTFS_DIR/var/tmp"
+          sudo mkdir -p \
+            "$ROOTFS_DIR/run" \
+            "$ROOTFS_DIR/root" \
+            "$ROOTFS_DIR/dev/shm" \
+            "$ROOTFS_DIR/tmp/.X11-unix" \
+            "$ROOTFS_DIR/var/log"
+          sudo chmod 1777 "$ROOTFS_DIR/tmp/.X11-unix"
+          sudo rm -f "$ROOTFS_DIR/etc/resolv.conf"
+          sudo install -m 0644 /dev/null "$ROOTFS_DIR/etc/resolv.conf"
+          sudo chroot "$ROOTFS_DIR" /usr/bin/dpkg --print-architecture | grep -qx arm64
+          sudo chroot "$ROOTFS_DIR" /bin/bash -lc 'test "$(getconf LONG_BIT)" = 64 && test -x /bin/bash && test -x /bin/sh'
+          for path in \
+            usr/lib/xorg/modules/drivers/fbdev_drv.so \
+            usr/lib/xorg/modules/input/evdev_drv.so \
+            usr/bin/dbus-run-session \
+            usr/bin/startxfce4 \
+            usr/bin/xfconf-query \
+            usr/bin/xfce4-session \
+            usr/bin/xfce4-panel \
+            usr/bin/xfdesktop \
+            usr/bin/xfwm4 \
+            usr/bin/thunar \
+            usr/bin/onboard \
+            usr/bin/openbox-session \
+            usr/bin/openbox \
+            usr/share/X11/xkb; do
+            if [ ! -e "$ROOTFS_DIR/$path" ]; then
+              printf 'Required Desktop component missing: /%s\n' "$path" >&2
+              exit 1
+            fi
+          done
+          for path in \
+            usr/bin/dbus-run-session \
+            usr/bin/startxfce4 \
+            usr/bin/xfconf-query \
+            usr/bin/xfce4-session \
+            usr/bin/xfce4-panel \
+            usr/bin/xfdesktop \
+            usr/bin/xfwm4 \
+            usr/bin/thunar \
+            usr/bin/onboard \
+            usr/bin/openbox-session \
+            usr/bin/openbox; do
+            if [ ! -x "$ROOTFS_DIR/$path" ]; then
+              printf 'Required Desktop executable is not executable: /%s\n' "$path" >&2
+              exit 1
+            fi
+          done
+          XORG_PATH=""
+          for path in usr/lib/xorg/Xorg usr/bin/Xorg usr/bin/X; do
+            if [ -x "$ROOTFS_DIR/$path" ]; then
+              XORG_PATH="/$path"
+              break
+            fi
+          done
+          if [ -z "$XORG_PATH" ]; then
+            printf 'Xorg executable missing\n' >&2
+            exit 1
+          fi
+          file "$ROOTFS_DIR$XORG_PATH" | grep -Eq 'ARM aarch64|ARM64'
+          file "$ROOTFS_DIR/usr/lib/xorg/modules/drivers/fbdev_drv.so" | grep -Eq 'ARM aarch64|ARM64'
+          file "$ROOTFS_DIR/usr/lib/xorg/modules/input/evdev_drv.so" | grep -Eq 'ARM aarch64|ARM64'
+          sudo chroot "$ROOTFS_DIR" "$XORG_PATH" -version > "$OUTPUT_DIR/xorg-version.txt" 2>&1
+          sudo chroot "$ROOTFS_DIR" /usr/bin/dbus-run-session -- /bin/sh -c 'test -n "$DBUS_SESSION_BUS_ADDRESS"'
+          sudo chroot "$ROOTFS_DIR" /usr/bin/dpkg-query -W -f='${binary:Package}\t${Version}\n' > "$OUTPUT_DIR/packages.txt"
+          sort -o "$OUTPUT_DIR/packages.txt" "$OUTPUT_DIR/packages.txt"
+          sudo rm -f "$ROOTFS_DIR/usr/bin/qemu-aarch64-static"
+          printf '%s\n' \
+            'Xorg: /usr/lib/xorg/Xorg or /usr/bin/Xorg' \
+            'Xorg video module: /usr/lib/xorg/modules/drivers/fbdev_drv.so' \
+            'Xorg input module: /usr/lib/xorg/modules/input/evdev_drv.so' \
+            'D-Bus launcher: /usr/bin/dbus-run-session' \
+            'XKB data: /usr/share/X11/xkb' \
+            'XFCE session: /usr/bin/startxfce4' \
+            'XFCE panel: /usr/bin/xfce4-panel' \
+            'XFCE desktop: /usr/bin/xfdesktop' \
+            'XFCE window manager: /usr/bin/xfwm4' \
+            'Touch keyboard: /usr/bin/onboard' \
+            'Openbox session: /usr/bin/openbox-session' \
+            'Xorg renderer: fbdev' \
+            'OpenGL fallback: Mesa llvmpipe software rendering' \
+            'Mali acceleration: not enabled' > "$OUTPUT_DIR/desktop-components.txt"
+          sudo chroot "$ROOTFS_DIR" /usr/bin/env DEBIAN_FRONTEND=noninteractive apt-get clean
+
+      - name: Create RootFS archives and ext4 image
+        shell: bash
+        run: |
+          set -euo pipefail
+          for mount_path in \
+            "$ROOTFS_DIR/dev/pts" \
+            "$ROOTFS_DIR/dev" \
+            "$ROOTFS_DIR/proc" \
+            "$ROOTFS_DIR/sys"; do
+            if mountpoint -q "$mount_path"; then
+              printf 'Unexpected mount left in RootFS staging tree: %s\n' "$mount_path" >&2
+              exit 1
+            fi
+          done
+          ROOTFS_TAR="$OUTPUT_DIR/${ROOTFS_NAME}.tar.zst"
+          ROOTFS_IMAGE="$OUTPUT_DIR/${ROOTFS_NAME}.ext4"
+          sudo tar \
+            --numeric-owner \
+            --acls \
+            --xattrs \
+            --use-compress-program='zstd -T0 -10' \
+            -cpf "$ROOTFS_TAR" \
+            -C "$ROOTFS_DIR" .
+          truncate -s "${EXT4_SIZE_GIB}G" "$ROOTFS_IMAGE"
+          sudo mkfs.ext4 \
+            -F \
+            -q \
+            -m 0 \
+            -L UBUNTU_ROOTFS \
+            -O '^64bit,^metadata_csum,^metadata_csum_seed,^orphan_file,^fast_commit,^casefold,^encrypt,^verity' \
+            -E lazy_itable_init=0,lazy_journal_init=0 \
+            "$ROOTFS_IMAGE"
+          sudo mount -o loop "$ROOTFS_IMAGE" "$IMAGE_MOUNT"
+          cleanup_image_mount() {
+            set +e
+            if mountpoint -q "$IMAGE_MOUNT"; then sudo umount "$IMAGE_MOUNT"; fi
+          }
+          trap cleanup_image_mount EXIT
+          sudo cp -a --sparse=always --preserve=all "$ROOTFS_DIR"/. "$IMAGE_MOUNT"/
+          sync
+          sudo umount "$IMAGE_MOUNT"
+          sudo e2fsck -fn "$ROOTFS_IMAGE"
+          sudo chown "$USER":"$USER" "$ROOTFS_TAR" "$ROOTFS_IMAGE"
+          ROOTFS_USED_MIB=$(sudo du -sm "$ROOTFS_DIR" | awk '{print $1}')
+          ROOTFS_TAR_MIB=$(du -m "$ROOTFS_TAR" | awk '{print $1}')
+          printf 'Ubuntu suite: %s\nArchitecture: arm64\nProfile: desktop\nDesktop sessions: xfce, openbox\nDisplay server: Xorg\nFramebuffer driver: xserver-xorg-video-fbdev\nInput driver: xserver-xorg-input-evdev\nSoftware keyboard: onboard\nSoftware GL fallback: Mesa llvmpipe\nMali hardware acceleration: disabled\nExt4 image size: %s GiB\nRootFS installed size: %s MiB\nCompressed archive size: %s MiB\nTar extraction path: /data/ubuntu\nExt4 mount path example: /mnt/ubuntu\n' \
+            "$UBUNTU_SUITE" "$EXT4_SIZE_GIB" "$ROOTFS_USED_MIB" "$ROOTFS_TAR_MIB" > "$OUTPUT_DIR/manifest.txt"
+          cat > "$OUTPUT_DIR/README-ja.txt" <<EOF
+          Ubuntu ARM64 Desktop RootFS
+          
+          Suite: ${UBUNTU_SUITE}
+          Architecture: arm64
+          Desktop: XFCE4 and Openbox
+          X server: Xorg with fbdev
+          Input: evdev
+          Touch keyboard: Onboard
+          Renderer: CPU software rendering / Mesa llvmpipe fallback
+          Mali hardware acceleration: disabled
+          
+          Directory installation:
+            mkdir -p /data/ubuntu
+            tar --zstd -xpf ${ROOTFS_NAME}.tar.zst -C /data/ubuntu
+          
+          Ext4 image:
+            mkdir -p /mnt/ubuntu
+            mount -t ext4 /dev/block/by-name/ubuntu /mnt/ubuntu
+          
+          Preflight for the supplied ubuntu-loader.cpp:
+            /sbin/ubuntu-loader --rootfs /data/ubuntu --check-desktop --desktop-session xfce
+          
+          Start XFCE desktop:
+            adb shell -tt /sbin/ubuntu-loader --rootfs /data/ubuntu --display desktop --desktop-session xfce --freeze-pid auto
+          
+          Start Openbox desktop:
+            adb shell -tt /sbin/ubuntu-loader --rootfs /data/ubuntu --display desktop --desktop-session openbox --freeze-pid auto
+          
+          For a mounted ext4 directory, replace /data/ubuntu with /mnt/ubuntu.
+          The ext4 image must be mounted by TWRP before running ubuntu-loader.
+          EOF
+          sha256sum "$ROOTFS_TAR" "$ROOTFS_IMAGE" > "$OUTPUT_DIR/SHA256SUMS"
+          {
+            printf '## Ubuntu ARM64 Desktop RootFS\n\n'
+            printf 'Ubuntu suite: `%s`\n\n' "$UBUNTU_SUITE"
+            printf 'Architecture: `arm64`\n\n'
+            printf 'Desktop sessions: `xfce`, `openbox`\n\n'
+            printf 'Xorg display driver: `fbdev`\n\n'
+            printf 'Xorg input driver: `evdev`\n\n'
+            printf 'Software keyboard: `onboard`\n\n'
+            printf 'Mesa fallback: `llvmpipe` (software only)\n\n'
+            printf 'Ext4 image size: `%s GiB`\n\n' "$EXT4_SIZE_GIB"
+            printf 'Installed RootFS size: `%s MiB`\n\n' "$ROOTFS_USED_MIB"
+            printf 'Artifacts:\n\n'
+            printf -- '- `%s`\n' \
+              "$(basename "$ROOTFS_TAR")" \
+              "$(basename "$ROOTFS_IMAGE")" \
+              'manifest.txt' \
+              'packages.txt' \
+              'desktop-components.txt' \
+              'xorg-version.txt' \
+              'README-ja.txt' \
+              'SHA256SUMS'
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat "$OUTPUT_DIR/manifest.txt" >> "$GITHUB_STEP_SUMMARY"
+          cat "$OUTPUT_DIR/desktop-components.txt" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Ubuntu ARM64 Desktop RootFS artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ubuntu-${{ inputs.ubuntu_suite }}-arm64-desktop-rootfs
+          path: out/*
+          if-no-files-found: error
+          compression-level: 6
+          retention-days: 30

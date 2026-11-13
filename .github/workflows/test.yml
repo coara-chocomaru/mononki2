@@ -77,6 +77,7 @@ jobs:
           esac
           sudo rm -rf "$ROOTFS_DIR"
           sudo mkdir -p "$ROOTFS_DIR" "$OUTPUT_DIR" "$IMAGE_MOUNT"
+          sudo chown -R "$USER":"$USER" "$OUTPUT_DIR"
           sudo debootstrap \
             --arch=arm64 \
             --foreign \

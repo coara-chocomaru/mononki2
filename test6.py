@@ -2,50 +2,90 @@
 # -*- coding: utf-8 -*-
 """
 ================================================================================
-mode_tool.py  —  MTK preloader ブートモード切替ツール
+mode_tool.py  v2  —  MTK preloader ブートモード切替ツール
 ================================================================================
-対象: MT8167 / MT8135 系 preloader (0e8d:2000)
+v2: pyserial 解決を堅牢化。serial シャドウイング / 旧 serial パッケージ /
+    ポート占有 / write_timeout 非対応 を個別に処理し、--diagnose を追加。
 
 【根拠 (アセンブリ)】
-  0x1B78 : ldrh r4,[r0,#0x36]  ブートタグの boot_mode を読む
-  0x1C28 : cmp r4,#6           ATE 専用分岐 (6 のとき PAD/GPIO を切替)
-  0x24AC : モード 0/±1/±2/±3 -> r5=1..5、r10=2/1 で PMIC 経路選択
-  0x3034 : [r4+0x3C] が 1/4 で分岐する EMI/DRAM 設定
-  0x35F4 : [r4+0x8] が 3/5 で分岐する EMI/PMIC/クロック初期化
-  0x1E7CC/0x1E820/0x1E830 : 0xD8 ステータスの 3 プローブ
-  => モードは RTC PDN1[5:0] に永続。BROM が +0x36 へ転記する。
-     RTC 書き込みは BBPU 上位 16bit = 0x4300 のアンロックが必須。
+  0x1B78 ldrh r4,[r0,#0x36]  ブートタグの boot_mode
+  0x1C28 cmp r4,#6           ATE 専用 PAD/GPIO 分岐
+  0x24AC モード 0/±1/±2/±3 -> r5=1..5, r10=2/1 で PMIC 経路
+  0x3034 [r4+0x3C] が 1/4 で分岐する EMI/DRAM 設定
+  0x35F4 [r4+0x8] が 3/5 で分岐する EMI/PMIC/クロック初期化
+  0x1E7CC/0x1E820/0x1E830  0xD8 ステータスの 3 プローブ
+  => モードは RTC PDN1[5:0] に永続。書き込みは BBPU 上位16bit=0x4300 必須。
 
 【プロトコル (0x1618-0x1694)】
-  handshake: pattern[i] と比較し 一致=^0xFF / 不一致=受信値+1 かつ i=0
+  一致=^0xFF / 不一致=受信値+1 かつ i=0
   0xD0 READ16 / 0xD1 READ32 / 0xD2 WRITE16 / 0xD4 WRITE32
-  0xD5 JUMP / 0xD7 SEND_DA / 0xD8 STATUS / 0xFC ENTRY / 0xFD BASE / 0xFE PING
-
-【使い方】
-  python mode_tool.py --list
-  python mode_tool.py --read
-  python mode_tool.py --mode factory
-  python mode_tool.py --mode ate --no-reset
-  python mode_tool.py --mode meta --method payload
-  python mode_tool.py --restore
+  0xD5 JUMP / 0xD7 SEND_DA / 0xD8 STATUS / 0xFE PING
 ================================================================================
 """
 
 import argparse
 import datetime
+import os
 import struct
 import sys
 import time
 import traceback
 
-try:
-    import serial
-    import serial.tools.list_ports
-    HAS_SERIAL = True
-except ImportError:
-    HAS_SERIAL = False
+# ================================================================
+# pyserial 解決
+# ================================================================
+SERIAL_CLS = None
+LIST_PORTS = None
+SERIAL_VER = None
+SERIAL_PATH = None
 
-# ---------------------------------------------------------------- 定数
+
+class LinkError(Exception):
+    pass
+
+
+def load_serial():
+    """pyserial を確実に解決する。旧 serial / シャドウイングを弾く。"""
+    global SERIAL_CLS, LIST_PORTS, SERIAL_VER, SERIAL_PATH
+    try:
+        import serial as s
+    except ImportError:
+        raise LinkError("pyserial 未導入 -> pip install pyserial")
+
+    SERIAL_PATH = getattr(s, "__file__", "?")
+    SERIAL_VER = getattr(s, "__version__", None)
+
+    # 旧 'serial' パッケージは Serial を持たない
+    if not hasattr(s, "Serial"):
+        raise LinkError(
+            "import serial が pyserial ではありません: " + str(SERIAL_PATH) +
+            " -> pip install --force-reinstall pyserial"
+            " / 作業フォルダの serial.py を退避")
+
+    # シャドウイング検査 (site-packages 以外なら警告のみ)
+    if SERIAL_PATH and "site-packages" not in SERIAL_PATH.replace("\\", "/"):
+        print(f"[!] 警告: serial が site-packages 外: {SERIAL_PATH}")
+
+    try:
+        from serial.tools import list_ports as lp
+    except Exception as e:
+        raise LinkError(f"serial.tools.list_ports 不在: {e}")
+    LIST_PORTS = lp
+
+    cls = s.Serial
+    # write_timeout 非対応の古い版を検出
+    try:
+        probe = cls(port="__none__", baudrate=9600, timeout=0.01, write_timeout=0.01)
+        probe.close()
+        SERIAL_CLS = cls
+    except TypeError:
+        SERIAL_CLS = cls
+        print("[!] write_timeout 非対応版。キーワード無しで開きます")
+    except Exception:
+        SERIAL_CLS = cls
+    return True
+
+
 MTK_VID = 0x0E8D
 PRE_PIDS = (0x2000, 0x2001, 0x201C, 0x3000, 0x2003, 0x201D)
 BROM_PIDS = (0x0003, 0x0006, 0x0007)
@@ -85,19 +125,18 @@ WDT_SWRST_KEY = 0x1209
 
 MODE_MASK = 0x3F
 STUB = 0x40001000
-STUB_ALT = 0x40002000
 
 LOG_PATH = "mode_tool.log"
 _fh = None
 
 MODES = {
-    "normal":   (0, "通常起動。BROM が preloader をロードして lk へ渡す"),
+    "normal":   (0, "通常起動。BROM が preloader をロードして lk へ"),
     "meta":     (1, "META。preloader が usbdl に入り 0e8d:2000 で待受"),
-    "recovery": (2, "リカバリ。lk が recovery を選択"),
-    "swreboot": (3, "SW リブート。0x3034 の [r4+0x3C]=1 系 EMI 設定"),
-    "factory":  (4, "ファクトリ。0x1C28 の汎用分岐、0x35F4 の [r4+0x8]=4 系"),
-    "advmeta":  (5, "ADV META。0x35F4 の [r4+0x8]=5 系"),
-    "ate":      (6, "ATE ファクトリ。0x1C28 が 6 で専用 PAD/GPIO に切替"),
+    "recovery": (2, "リカバリ"),
+    "swreboot": (3, "SW リブート。[r4+0x3C]=1 系 EMI 設定"),
+    "factory":  (4, "ファクトリ。0x1C28 汎用分岐 / [r4+0x8]=4 系"),
+    "advmeta":  (5, "ADV META。[r4+0x8]=5 系"),
+    "ate":      (6, "ATE ファクトリ。0x1C28 が 6 で専用 PAD/GPIO"),
     "fastboot": (7, "fastboot"),
 }
 
@@ -117,14 +156,14 @@ def log(msg, tag="*"):
 
 
 # ================================================================
-# 検出 (列挙のみ / ct6 と同一)
+# 検出 (列挙のみ)
 # ================================================================
 def find_mtk_ports():
     out = []
-    if not HAS_SERIAL:
+    if LIST_PORTS is None:
         return out
     try:
-        for p in serial.tools.list_ports.comports():
+        for p in LIST_PORTS.comports():
             if p.vid == MTK_VID and p.pid is not None:
                 out.append((p.device, p.pid, p.description or ""))
     except Exception:
@@ -138,10 +177,10 @@ def find_preloader_ports():
 
 def fallback_ports():
     out = []
-    if not HAS_SERIAL:
+    if LIST_PORTS is None:
         return out
     try:
-        for p in serial.tools.list_ports.comports():
+        for p in LIST_PORTS.comports():
             d = (p.description or "").lower()
             if p.vid == MTK_VID or any(k in d for k in KW):
                 out.append((p.device, p.pid, p.description or ""))
@@ -173,20 +212,45 @@ def dump_ports():
         log(f"  {dev} 0e8d:{pid:04x} [{m}] {desc}", ".")
 
 
+def resolve_port(name):
+    """device でなければ説明文字列から解決する。"""
+    if not name:
+        return None
+    ports = find_mtk_ports() or fallback_ports()
+    for dev, pid, desc in ports:
+        if dev.lower() == name.lower():
+            return dev
+    low = name.lower()
+    for dev, pid, desc in ports:
+        if low in (desc or "").lower():
+            return dev
+    return None
+
+
 # ================================================================
 # リンク
 # ================================================================
-class LinkError(Exception):
-    pass
-
-
 class Link:
     def __init__(self, port):
         self.port = port
         self.ser = None
 
     def open(self):
-        self.ser = serial.Serial(self.port, BAUD, timeout=IO_TO, write_timeout=WR_TO)
+        last = None
+        for attempt in range(6):
+            try:
+                try:
+                    self.ser = SERIAL_CLS(port=self.port, baudrate=BAUD,
+                                          timeout=IO_TO, write_timeout=WR_TO)
+                except TypeError:
+                    self.ser = SERIAL_CLS(port=self.port, baudrate=BAUD, timeout=IO_TO)
+                break
+            except Exception as e:
+                last = e
+                self.ser = None
+                time.sleep(0.4)
+        else:
+            raise LinkError(f"open 失敗 {self.port}: {type(last).__name__}: {last}")
         try:
             self.ser.reset_input_buffer()
             self.ser.reset_output_buffer()
@@ -232,7 +296,7 @@ class Link:
             try:
                 self.ser.timeout = min(left, 0.4)
                 c = self.ser.read(n - len(buf))
-            except serial.SerialException as e:
+            except Exception as e:
                 raise LinkError(f"rx: {e}")
             if c:
                 buf += c
@@ -242,10 +306,9 @@ class Link:
         try:
             self.ser.write(data)
             self.ser.flush()
-        except serial.SerialException as e:
+        except Exception as e:
             raise LinkError(f"tx: {e}")
 
-    # ---- 0x1674 仕様 ----
     def handshake(self):
         prefix = []
         guess = PATTERN_HINT[0]
@@ -280,7 +343,6 @@ class Link:
             time.sleep(HSHK_GAP)
         raise LinkError(f"handshake failed prefix={[hex(x) for x in prefix]}")
 
-    # ---- エコー ----
     def echo(self, data, tag="e", timeout=None):
         self.tx(data)
         got = self.rx(len(data), timeout)
@@ -295,7 +357,6 @@ class Link:
         if st & 0xFF:
             raise LinkError(f"{tag} status 0x{st:04X}")
 
-    # ---- 0xD1 / 0xD0 ----
     def read32(self, addr, cnt, timeout=15.0):
         self.begin(CMD_READ32, addr, cnt, "read32")
         out = []
@@ -314,14 +375,6 @@ class Link:
     def read_u32(self, addr):
         return self.read32(addr, 1, timeout=4.0)[0]
 
-    def read16(self, addr, cnt):
-        self.begin(CMD_READ16, addr, cnt, "read16")
-        d = self.rx(cnt * 2, 8.0)
-        self.rx(2, 1.0)
-        n = len(d) // 2
-        return list(struct.unpack(">%dH" % n, d[:n * 2]))
-
-    # ---- 0xD4 (4 バイト整列 / 0x19FC) ----
     def write32(self, addr, vals, verify=True, timeout=8.0):
         if addr & 3:
             raise LinkError("write32: 4 バイト整列が必要")
@@ -337,7 +390,6 @@ class Link:
     def set32(self, addr, val, verify=True):
         self.write32(addr, [val], verify=verify)
 
-    # ---- 0xD7 ----
     def send_da(self, data, addr, timeout=8.0):
         self.echo(bytes([CMD_SEND_DA]), "send_da")
         self.echo(struct.pack(">I", addr & 0xFFFFFFFF), "send_da.a")
@@ -356,7 +408,6 @@ class Link:
         self.echo(struct.pack(">I", addr & 0xFFFFFFFF), "jump.a")
         return struct.unpack(">H", self.rx(2, timeout))[0]
 
-    # ---- 0xD8 ----
     def status(self):
         self.tx(bytes([CMD_STATUS]))
         r = self.rx(1, 1.0)
@@ -374,22 +425,15 @@ class Link:
 # ================================================================
 def rtc_unlock(l):
     cur = l.read_u32(RTC_BBPU)
-    l.set32(RTC_BBPU, (cur & 0xFFFF) | RTC_KEY)
+    l.set32(RTC_BBPU, (cur & 0xFFFF) | RTC_KEY, verify=False)
 
 
 def rtc_lock(l):
     cur = l.read_u32(RTC_BBPU)
-    l.set32(RTC_BBPU, cur & ~RTC_KEY_MASK & 0xFFFFFFFF)
-
-
-def read_mode(l):
-    pdn1 = l.read_u32(RTC_PDN1)
-    pdn2 = l.read_u32(RTC_PDN2)
-    return pdn1, pdn2
+    l.set32(RTC_BBPU, cur & ~RTC_KEY_MASK & 0xFFFFFFFF, verify=False)
 
 
 def set_mode_rtc(l, mode, pdn2_bits=None):
-    """PDN1[5:0] = mode。アンロック -> RMW -> 検証 -> ロック。"""
     rtc_unlock(l)
     try:
         cur = l.read_u32(RTC_PDN1)
@@ -397,7 +441,7 @@ def set_mode_rtc(l, mode, pdn2_bits=None):
         l.set32(RTC_PDN1, new, verify=False)
         back = l.read_u32(RTC_PDN1)
         if (back & MODE_MASK) != (mode & MODE_MASK):
-            raise LinkError(f"PDN1 反映失敗 {back:#010x} (要求 mode={mode})")
+            raise LinkError(f"PDN1 反映失敗 {back:#010x} mode={mode}")
         if pdn2_bits is not None:
             cur2 = l.read_u32(RTC_PDN2)
             l.set32(RTC_PDN2, (cur2 | pdn2_bits) & 0xFFFFFFFF, verify=False)
@@ -406,7 +450,6 @@ def set_mode_rtc(l, mode, pdn2_bits=None):
 
 
 def write_tag(l, tag_addr, mode):
-    """ブートタグ +0x36 (0x1B78 / 0x1C28 が読む位置) を直接更新。"""
     if not tag_addr:
         return
     addr = tag_addr + 0x36
@@ -423,14 +466,10 @@ def swrst(l):
         l.set32(WDT_MODE, WDT_MODE_KEY | 0x14, verify=False)
         l.set32(WDT_RESTART, WDT_RESTART_KEY, verify=False)
         l.set32(WDT_SWRST, WDT_SWRST_KEY, verify=False)
-        return True
     except LinkError:
-        return True
+        pass
 
 
-# ================================================================
-# ペイロード法
-# ================================================================
 B_SELF = 0xEAFFFFFE
 
 
@@ -457,21 +496,9 @@ def build(pairs):
 
 
 def payload_for_mode(mode):
-    """RTC アンロック -> PDN1 下位6bit を mode に -> ロック -> WDT SWRST。"""
-    pairs = [
-        (RTC_BBPU, RTC_KEY),                  # アンロック
-        (RTC_PDN1, mode & MODE_MASK),         # 下位6bit を設定 (他bit は 0 になる)
-        (RTC_BBPU, 0),                        # ロック
-        (WDT_MODE, WDT_MODE_KEY | 0x14),
-        (WDT_RESTART, WDT_RESTART_KEY),
-        (WDT_SWRST, WDT_SWRST_KEY),
-    ]
-    return build(pairs)
-
-
-def words(p):
-    pad = (-len(p)) % 4
-    return list(struct.unpack("<%dI" % ((len(p) + pad) // 4), p + b"\x00" * pad))
+    return build([(RTC_BBPU, RTC_KEY), (RTC_PDN1, mode & MODE_MASK),
+                  (RTC_BBPU, 0), (WDT_MODE, WDT_MODE_KEY | 0x14),
+                  (WDT_RESTART, WDT_RESTART_KEY), (WDT_SWRST, WDT_SWRST_KEY)])
 
 
 # ================================================================
@@ -486,9 +513,8 @@ def do_mode(port, mode, method, reset, tag_addr, pdn2_bits):
     try:
         pat = l.handshake()
         log(f"handshake OK {[hex(x) for x in pat]}", "+")
-
-        pdn1, pdn2 = read_mode(l)
-        log(f"現在 PDN1=0x{pdn1:08X} mode={pdn1 & MODE_MASK} / PDN2=0x{pdn2:08X}")
+        pdn1 = l.read_u32(RTC_PDN1)
+        log(f"現在 PDN1=0x{pdn1:08X} mode={pdn1 & MODE_MASK}")
         try:
             log(f"status=0x{l.status():02X}")
         except LinkError:
@@ -496,28 +522,23 @@ def do_mode(port, mode, method, reset, tag_addr, pdn2_bits):
 
         if method == "rtc":
             set_mode_rtc(l, mode, pdn2_bits)
-            log(f"PDN1 更新 -> mode={mode}", "+")
         elif method == "payload":
-            data = payload_for_mode(mode)
-            log(f"payload {len(data)}B を 0x{STUB:08X} へ", ".")
-            st = l.send_da(data, STUB)
+            st = l.send_da(payload_for_mode(mode), STUB)
             if st & 0xFF:
                 log(f"send_da 失敗 0x{st:04X}", "!")
                 return False
-            l.send_da(b"\x00\x00\x00\x00", STUB)   # 準備フラグ (0x18D4)
+            l.send_da(b"\x00\x00\x00\x00", STUB)
             js = l.jump(STUB)
             log(f"jump=0x{js:04X}", ".")
             if reset:
-                return True                      # payload 内で SWRST 済み
+                return True
         elif method == "tag":
             set_mode_rtc(l, mode, pdn2_bits)
             write_tag(l, tag_addr, mode)
-            log(f"PDN1 とタグ +0x36 を更新", "+")
 
         if tag_addr and method != "tag":
             write_tag(l, tag_addr, mode)
 
-        # 反映確認
         back = l.read_u32(RTC_PDN1)
         if (back & MODE_MASK) != (mode & MODE_MASK):
             log(f"反映確認失敗 PDN1=0x{back:08X}", "!")
@@ -538,13 +559,45 @@ def do_mode(port, mode, method, reset, tag_addr, pdn2_bits):
             pass
 
 
+def diagnose(port):
+    print("=== 診断 ===")
+    print(f"python      : {sys.version.split()[0]} ({sys.executable})")
+    print(f"cwd         : {os.getcwd()}")
+    print(f"serial path : {SERIAL_PATH}")
+    print(f"serial ver  : {SERIAL_VER}")
+    print(f"Serial 有無 : {hasattr(SERIAL_CLS, '__call__') if SERIAL_CLS else False}")
+    shadow = os.path.join(os.getcwd(), "serial.py")
+    print(f"serial.py 隣接: {os.path.exists(shadow)}" + ("  <= これが原因" if os.path.exists(shadow) else ""))
+    print("ポート:")
+    for dev, pid, desc in find_mtk_ports():
+        print(f"  {dev} 0e8d:{pid:04x} {desc}")
+    for dev, pid, desc in fallback_ports():
+        if (dev, pid, desc) not in find_mtk_ports():
+            print(f"  {dev} (pid不明) {desc}")
+    if not port:
+        print("open 試験: 対象未指定")
+        return
+    print(f"open 試験: {port}")
+    try:
+        l = Link(port).open()
+        print("  open OK")
+        try:
+            print(f"  handshake: {[hex(x) for x in l.handshake()]}")
+        except Exception as e:
+            print(f"  handshake NG: {e}")
+        l.close()
+    except Exception as e:
+        print(f"  open NG: {type(e).__name__}: {e}")
+        print("  対処: 他アプリを閉じる / USB 挿し直す / ドライバ再導入")
+
+
 def main(argv=None):
     global _fh
-    ap = argparse.ArgumentParser(description="preloader ブートモード切替")
+    ap = argparse.ArgumentParser(description="preloader ブートモード切替 v2")
     ap.add_argument("--mode", default=None)
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--read", action="store_true")
-    ap.add_argument("--restore", action="store_true", help="normal に戻す")
+    ap.add_argument("--restore", action="store_true")
     ap.add_argument("--method", choices=("rtc", "payload", "tag"), default="rtc")
     ap.add_argument("--no-reset", action="store_true")
     ap.add_argument("--pdn2", type=lambda s: int(s, 0), default=None)
@@ -552,11 +605,14 @@ def main(argv=None):
     ap.add_argument("--port", default=None)
     ap.add_argument("--wait", type=float, default=90.0)
     ap.add_argument("--ports", action="store_true")
+    ap.add_argument("--diagnose", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args(argv)
 
-    if not HAS_SERIAL:
-        print("pip install pyserial")
+    try:
+        load_serial()
+    except LinkError as e:
+        print(f"[!] {e}")
         return 2
     try:
         _fh = open(LOG_PATH, "w", encoding="utf-8")
@@ -565,63 +621,63 @@ def main(argv=None):
 
     try:
         if a.list:
-            print("モード一覧:")
             for k, (v, note) in MODES.items():
                 print(f"  {k:9s} = {v}  {note}")
             return 0
-
         if a.ports:
             dump_ports()
             return 0
 
-        if not (a.mode or a.read or a.restore):
-            print("--mode / --read / --restore / --list のいずれかを指定")
-            return 2
-
         name = "normal" if a.restore else a.mode
-        if name is None:
-            mode = None
-        elif name in MODES:
-            mode = MODES[name][0]
-        else:
-            try:
-                mode = int(name, 0)
-            except ValueError:
-                print(f"不明なモード: {name}")
-                return 2
+        mode = None
+        if name is not None:
+            if name in MODES:
+                mode = MODES[name][0]
+            else:
+                try:
+                    mode = int(name, 0)
+                except ValueError:
+                    print(f"不明なモード: {name}")
+                    return 2
 
-        port = a.port or wait_preloader(a.wait)
+        port = resolve_port(a.port) if a.port else None
+        if a.port and not port:
+            print(f"ポート '{a.port}' を解決できません")
+            dump_ports()
+            return 2
+        if not port and (a.diagnose or not a.read):
+            port = wait_preloader(a.wait)
+        if a.diagnose:
+            diagnose(port)
+            return 0
         if not port:
             log("preloader 未検出", "!")
             dump_ports()
             return 2
-        log(f"port: {port}", "+")
 
         if a.read:
             with Link(port) as l:
                 l.handshake()
-                pdn1, pdn2 = read_mode(l)
+                pdn1 = l.read_u32(RTC_PDN1)
+                pdn2 = l.read_u32(RTC_PDN2)
                 print(f"RTC_PDN1 = 0x{pdn1:08X}  boot_mode = {pdn1 & MODE_MASK}")
                 print(f"RTC_PDN2 = 0x{pdn2:08X}")
                 for k, (v, note) in MODES.items():
                     if v == (pdn1 & MODE_MASK):
                         print(f"該当: {k} ({note})")
-                try:
-                    print(f"status   = 0x{l.status():02X}")
-                except LinkError:
-                    pass
             return 0
 
+        if mode is None:
+            print("--mode / --read / --restore / --list / --diagnose を指定")
+            return 2
         if a.dry_run:
             print(f"mode={name}({mode}) method={a.method} reset={not a.no_reset}")
             return 0
 
-        ok = do_mode(port, mode, a.method, not a.no_reset, a.tag_addr, a.pdn2)
-        if not ok:
+        if not do_mode(port, mode, a.method, not a.no_reset, a.tag_addr, a.pdn2):
             return 1
 
         if not a.no_reset:
-            log("リセット後の再列挙を待機...", ".")
             time.sleep(1.0)
             end = time.monotonic() + 12
             seen = None
@@ -635,9 +691,9 @@ def main(argv=None):
             if seen:
                 log(f"再列挙: {seen[0]} 0e8d:{seen[1]:04x}", "+")
                 if seen[1] in PRE_PIDS:
-                    log("preloader 復帰。モードは反映済み (--read で確認)", "+")
+                    log("preloader 復帰。--read でモードを確認", "+")
             else:
-                log("再列挙なし。ケーブルを挿し直して --read で確認", "!")
+                log("再列挙なし。挿し直して --read", "!")
         return 0
     finally:
         if _fh:

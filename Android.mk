@@ -1,0 +1,21 @@
+
+LOCAL_PATH := $(call my-dir)
+
+include $(CLEAR_VARS)
+
+LOCAL_MODULE := ubuntu-loader-test
+LOCAL_SRC_FILES := ubuntu_loader.cpp
+
+LOCAL_MODULE_TAGS := optional
+LOCAL_MODULE_CLASS := EXECUTABLES
+LOCAL_MODULE_PATH := $(TARGET_RECOVERY_ROOT_OUT)/sbin
+
+LOCAL_MULTILIB := 64
+LOCAL_CPP_STL := none
+LOCAL_CPPFLAGS := -std=gnu++11
+LOCAL_CFLAGS := -Wall -Wextra
+
+LOCAL_FORCE_STATIC_EXECUTABLE := true
+LOCAL_STATIC_LIBRARIES := libc
+
+include $(BUILD_EXECUTABLE)

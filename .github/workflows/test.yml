@@ -1,0 +1,212 @@
+name: Build Ubuntu ARM64 RootFS
+
+on:
+  workflow_dispatch:
+    inputs:
+      ubuntu_suite:
+        description: Ubuntu release for the ARM64 RootFS
+        required: true
+        type: choice
+        default: noble
+        options:
+          - noble
+          - jammy
+      ext4_size_gib:
+        description: Size of the generated ext4 image in GiB
+        required: true
+        type: choice
+        default: "3"
+        options:
+          - "2"
+          - "3"
+          - "4"
+          - "6"
+          - "8"
+          - "12"
+          - "16"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ubuntu-arm64-rootfs-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-rootfs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      UBUNTU_SUITE: ${{ inputs.ubuntu_suite }}
+      EXT4_SIZE_GIB: ${{ inputs.ext4_size_gib }}
+      ROOTFS_DIR: ${{ runner.temp }}/ubuntu-arm64-rootfs
+      IMAGE_MOUNT: ${{ runner.temp }}/ubuntu-arm64-image-mount
+      OUTPUT_DIR: ${{ github.workspace }}/out
+    steps:
+      - name: Install RootFS build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            binfmt-support \
+            debootstrap \
+            e2fsprogs \
+            file \
+            qemu-user-static \
+            zstd
+          test -x /usr/bin/qemu-aarch64-static
+          if ! mountpoint -q /proc/sys/fs/binfmt_misc; then
+            sudo mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc
+          fi
+          sudo systemctl restart systemd-binfmt.service || true
+          if [ ! -e /proc/sys/fs/binfmt_misc/qemu-aarch64 ]; then
+            sudo update-binfmts --enable qemu-aarch64
+          fi
+          test -e /proc/sys/fs/binfmt_misc/qemu-aarch64
+
+      - name: Bootstrap Ubuntu ARM64 base system
+        run: |
+          set -euo pipefail
+          case "$UBUNTU_SUITE" in
+            noble|jammy) ;;
+            *) printf 'Unsupported Ubuntu suite: %s\n' "$UBUNTU_SUITE" >&2; exit 1 ;;
+          esac
+          case "$EXT4_SIZE_GIB" in
+            2|3|4|6|8|12|16) ;;
+            *) printf 'Unsupported ext4 image size: %s\n' "$EXT4_SIZE_GIB" >&2; exit 1 ;;
+          esac
+          sudo rm -rf "$ROOTFS_DIR"
+          sudo mkdir -p "$ROOTFS_DIR" "$OUTPUT_DIR" "$IMAGE_MOUNT"
+          sudo debootstrap \
+            --arch=arm64 \
+            --foreign \
+            --variant=minbase \
+            --components=main,universe \
+            --include=apt,bash,ca-certificates \
+            "$UBUNTU_SUITE" \
+            "$ROOTFS_DIR" \
+            https://ports.ubuntu.com/ubuntu-ports
+          sudo cp /usr/bin/qemu-aarch64-static "$ROOTFS_DIR/usr/bin/qemu-aarch64-static"
+
+      - name: Complete ARM64 bootstrap and install CLI packages
+        run: |
+          set -euo pipefail
+          cleanup_rootfs_mounts() {
+            set +e
+            if mountpoint -q "$ROOTFS_DIR/dev/pts"; then sudo umount "$ROOTFS_DIR/dev/pts"; fi
+            if mountpoint -q "$ROOTFS_DIR/dev"; then sudo umount "$ROOTFS_DIR/dev"; fi
+            if mountpoint -q "$ROOTFS_DIR/proc"; then sudo umount "$ROOTFS_DIR/proc"; fi
+            if mountpoint -q "$ROOTFS_DIR/sys"; then sudo umount "$ROOTFS_DIR/sys"; fi
+          }
+          trap cleanup_rootfs_mounts EXIT
+          sudo mount --bind /dev "$ROOTFS_DIR/dev"
+          sudo mount --bind /dev/pts "$ROOTFS_DIR/dev/pts"
+          sudo mount -t proc proc "$ROOTFS_DIR/proc"
+          sudo mount -t sysfs sysfs "$ROOTFS_DIR/sys"
+          if [ -f /etc/resolv.conf ]; then
+            sudo cp -L /etc/resolv.conf "$ROOTFS_DIR/etc/resolv.conf"
+          fi
+          printf '%s\n' '#!/bin/sh' 'exit 101' | sudo tee "$ROOTFS_DIR/usr/sbin/policy-rc.d" >/dev/null
+          sudo chmod 755 "$ROOTFS_DIR/usr/sbin/policy-rc.d"
+          sudo chroot "$ROOTFS_DIR" /debootstrap/debootstrap --second-stage
+          sudo chroot "$ROOTFS_DIR" /usr/bin/env DEBIAN_FRONTEND=noninteractive apt-get update
+          sudo chroot "$ROOTFS_DIR" /usr/bin/env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            bash \
+            bash-completion \
+            ca-certificates \
+            coreutils \
+            curl \
+            file \
+            findutils \
+            grep \
+            gzip \
+            hostname \
+            iproute2 \
+            iputils-ping \
+            kmod \
+            less \
+            locales \
+            nano \
+            net-tools \
+            procps \
+            psmisc \
+            sed \
+            tar \
+            tzdata \
+            unzip \
+            util-linux \
+            vim-tiny \
+            wget \
+            xz-utils \
+            zstd
+          sudo chroot "$ROOTFS_DIR" /usr/bin/env DEBIAN_FRONTEND=noninteractive apt-get clean
+          sudo rm -rf "$ROOTFS_DIR/var/lib/apt/lists/"* "$ROOTFS_DIR/var/cache/apt/archives/"* "$ROOTFS_DIR/tmp/"* "$ROOTFS_DIR/var/tmp/"*
+          sudo rm -f "$ROOTFS_DIR/usr/sbin/policy-rc.d" "$ROOTFS_DIR/usr/bin/qemu-aarch64-static"
+          sudo rm -f "$ROOTFS_DIR/etc/machine-id" "$ROOTFS_DIR/var/lib/dbus/machine-id"
+          sudo install -m 0644 /dev/null "$ROOTFS_DIR/etc/machine-id"
+          printf '%s\n' 'ubuntu-recovery' | sudo tee "$ROOTFS_DIR/etc/hostname" >/dev/null
+          printf '%s\n' \
+            '127.0.0.1 localhost' \
+            '127.0.1.1 ubuntu-recovery' \
+            '::1 localhost ip6-localhost ip6-loopback' | sudo tee "$ROOTFS_DIR/etc/hosts" >/dev/null
+          printf '%s\n' 'LANG=C.UTF-8' 'LC_ALL=C.UTF-8' | sudo tee "$ROOTFS_DIR/etc/default/locale" >/dev/null
+          printf '%s\n' 'Etc/UTC' | sudo tee "$ROOTFS_DIR/etc/timezone" >/dev/null
+          sudo ln -snf /usr/share/zoneinfo/Etc/UTC "$ROOTFS_DIR/etc/localtime"
+          sudo chmod 1777 "$ROOTFS_DIR/tmp" "$ROOTFS_DIR/var/tmp"
+          sudo mkdir -p "$ROOTFS_DIR/run" "$ROOTFS_DIR/root"
+          sudo rm -f "$ROOTFS_DIR/etc/resolv.conf"
+          sudo install -m 0644 /dev/null "$ROOTFS_DIR/etc/resolv.conf"
+          sudo chroot "$ROOTFS_DIR" /usr/bin/dpkg --print-architecture | grep -qx arm64
+          sudo chroot "$ROOTFS_DIR" /bin/bash -lc 'test "$(getconf LONG_BIT)" = 64 && test -x /bin/bash && test -x /bin/sh'
+          file "$ROOTFS_DIR/bin/bash" | grep -E 'ARM aarch64|ARM64'
+          sudo chroot "$ROOTFS_DIR" /usr/bin/ldd --version | head -n 1
+
+      - name: Create RootFS archives and ext4 image
+        run: |
+          set -euo pipefail
+          ROOTFS_NAME="ubuntu-${UBUNTU_SUITE}-arm64-rootfs"
+          sudo chroot "$ROOTFS_DIR" /usr/bin/dpkg-query -W -f='${binary:Package}\t${Version}\n' | sort > "$OUTPUT_DIR/packages.txt"
+          TAR_PATH="$OUTPUT_DIR/${ROOTFS_NAME}.tar.zst"
+          IMAGE_PATH="$OUTPUT_DIR/${ROOTFS_NAME}.ext4"
+          sudo tar \
+            --numeric-owner \
+            --acls \
+            --xattrs \
+            --use-compress-program='zstd -T0 -10' \
+            -cpf "$TAR_PATH" \
+            -C "$ROOTFS_DIR" .
+          truncate -s "${EXT4_SIZE_GIB}G" "$IMAGE_PATH"
+          sudo mkfs.ext4 \
+            -F \
+            -q \
+            -m 0 \
+            -L UBUNTU_ROOTFS \
+            -O '^64bit,^metadata_csum,^metadata_csum_seed,^orphan_file,^fast_commit,^casefold,^encrypt,^verity' \
+            -E lazy_itable_init=0,lazy_journal_init=0 \
+            "$IMAGE_PATH"
+          sudo mount -o loop "$IMAGE_PATH" "$IMAGE_MOUNT"
+          sudo cp -a --preserve=all "$ROOTFS_DIR"/. "$IMAGE_MOUNT"/
+          sync
+          sudo umount "$IMAGE_MOUNT"
+          sudo e2fsck -fn "$IMAGE_PATH"
+          sudo chown "$USER" "$TAR_PATH" "$IMAGE_PATH"
+          printf 'Ubuntu suite: %s\nArchitecture: arm64\nFormat 1: tar.zst\nFormat 2: ext4\nExt4 image size: %s GiB\nRootFS path after extraction: /data/ubuntu\n' \
+            "$UBUNTU_SUITE" "$EXT4_SIZE_GIB" > "$OUTPUT_DIR/manifest.txt"
+          sha256sum "$TAR_PATH" "$IMAGE_PATH" > "$OUTPUT_DIR/SHA256SUMS"
+          {
+            printf '## Ubuntu ARM64 RootFS\n\n'
+            printf 'Ubuntu suite: `%s`\n\n' "$UBUNTU_SUITE"
+            printf 'Architecture: `arm64`\n\n'
+            printf 'Ext4 image size: `%s GiB`\n\n' "$EXT4_SIZE_GIB"
+            printf 'Generated files:\n\n'
+            printf -- '- `%s`\n' "$(basename "$TAR_PATH")" "$(basename "$IMAGE_PATH")" 'manifest.txt' 'packages.txt' 'SHA256SUMS'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Ubuntu ARM64 RootFS artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ubuntu-${{ inputs.ubuntu_suite }}-arm64-rootfs
+          path: out/*
+          if-no-files-found: error
+          compression-level: 6
+          retention-days: 30

@@ -5,45 +5,42 @@ on:
     branches: [ main, master ]
     paths:
       - 'input/logo.bin'
-      - 'logo_tool.py'
+      - 'logo_poc.py'
       - 'scripts/logo_tool.py'
       - '.github/workflows/mtk-logo.yml'
   workflow_dispatch:
     inputs:
-      out_prefix:
-        description: 'Output filename prefix'
+      color:
+        description: 'RGB565 fill color for replace_raw'
         required: true
-        default: 'logo'
-        type: string
+        default: 'white'
+        type: choice
+        options: [white, black, red, green, blue]
 
 permissions:
   contents: read
 
 env:
   PYTHON_VERSION: '3.11'
-  INPUT_LOGO:   'input/logo.bin'
-  TOOL_1:       'logo_tool.py'
-  TOOL_2:       'scripts/logo_tool.py'
-  OUT_DIR:      'out'
+  INPUT_LOGO: 'input/logo.bin'
+  TOOL_1: 'logo_tool.py'
+  TOOL_2: 'scripts/logo_tool.py'
+  OUT_DIR: 'out'
 
 jobs:
-  build-poc:
-    name: Build logo.bin PoC variants
+  build:
     runs-on: ubuntu-latest
     timeout-minutes: 20
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Resolve tool path
+      - name: resolve tool
         id: tool
         shell: bash
         run: |
@@ -53,160 +50,102 @@ jobs:
           elif [ -f "${TOOL_2}" ]; then
             echo "path=${TOOL_2}" >> "$GITHUB_OUTPUT"
           else
-            echo "::error::logo_tool.py not found at ${TOOL_1} or ${TOOL_2}"
+            echo "::error::logo_poc.py not found"
             exit 1
           fi
 
-      - name: Verify inputs
+      - name: verify
         shell: bash
         run: |
           set -euo pipefail
           [ -f "${INPUT_LOGO}" ] || { echo "::error::${INPUT_LOGO} missing"; exit 1; }
           python -m py_compile "${{ steps.tool.outputs.path }}"
-          ls -l "${INPUT_LOGO}" "${{ steps.tool.outputs.path }}"
           sha256sum "${INPUT_LOGO}" | tee "${INPUT_LOGO}.sha256"
 
-      - name: Prepare out dir
+      - name: mkdir out
+        run: mkdir -p "${OUT_DIR}"
+
+      - name: info
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p "${OUT_DIR}"
+          python "${{ steps.tool.outputs.path }}" info "${INPUT_LOGO}" \
+            > "${OUT_DIR}/info.txt"
+          cat "${OUT_DIR}/info.txt"
 
-      - name: dump original (always, for diagnostics)
+      - name: data_hex (first 0x100)
         shell: bash
         run: |
           set -euo pipefail
-          python "${{ steps.tool.outputs.path }}" dump "${INPUT_LOGO}" \
-            > "${OUT_DIR}/dump.txt"
-          head -40 "${OUT_DIR}/dump.txt"
+          python "${{ steps.tool.outputs.path }}" data_hex "${INPUT_LOGO}" 0 0x100 \
+            > "${OUT_DIR}/data_hex.txt"
+          cat "${OUT_DIR}/data_hex.txt"
 
-      - name: analyze original
+      - name: data_bmp_check
         shell: bash
         run: |
           set -euo pipefail
-          python "${{ steps.tool.outputs.path }}" analyze "${INPUT_LOGO}" \
-            > "${OUT_DIR}/analyze.txt"
-          cat "${OUT_DIR}/analyze.txt"
+          python "${{ steps.tool.outputs.path }}" data_bmp_check "${INPUT_LOGO}" \
+            > "${OUT_DIR}/data_bmp_check.txt"
+          cat "${OUT_DIR}/data_bmp_check.txt"
 
-      - name: Detect image count
-        id: analyze
+      - name: generate ALL PoC variants
         shell: bash
         run: |
           set -euo pipefail
-          count=$(grep -cE '^image [0-9]+' "${OUT_DIR}/analyze.txt" || true)
-          echo "image_count=${count}" >> "$GITHUB_OUTPUT"
-          echo "detected images: ${count}"
-          if [ "${count}" -lt 1 ]; then
-            echo "::error::no images parsed - see dump.txt / analyze.txt artifacts"
-            exit 1
-          fi
+          python "${{ steps.tool.outputs.path }}" all "${INPUT_LOGO}" "${OUT_DIR}"
 
-      - name: Build safe variant (all pixels white)
+      - name: replace_raw white (valid-size RGB565)
         shell: bash
         env:
-          PREFIX: ${{ inputs.out_prefix || 'logo' }}
+          COLOR: ${{ inputs.color || 'white' }}
         run: |
           set -euo pipefail
-          python "${{ steps.tool.outputs.path }}" safe "${INPUT_LOGO}" \
-            "${OUT_DIR}/${PREFIX}_safe.bin"
-          ls -l "${OUT_DIR}/${PREFIX}_safe.bin"
+          python "${{ steps.tool.outputs.path }}" replace_raw \
+            "${INPUT_LOGO}" 1280 800 "${OUT_DIR}/logo_raw_${COLOR}_full.bin" "${COLOR}"
 
-      - name: Build vuln variant - pattern (header untouched)
+      - name: replace_raw white (keep original body size)
         shell: bash
         env:
-          PREFIX: ${{ inputs.out_prefix || 'logo' }}
+          COLOR: ${{ inputs.color || 'white' }}
         run: |
           set -euo pipefail
-          python "${{ steps.tool.outputs.path }}" vuln "${INPUT_LOGO}" \
-            "${OUT_DIR}/${PREFIX}_vuln_pattern.bin" pattern
+          python "${{ steps.tool.outputs.path }}" replace_raw \
+            "${INPUT_LOGO}" 1280 800 "${OUT_DIR}/logo_raw_${COLOR}_keep.bin" "${COLOR}" 1
 
-      - name: Build vuln variant - alloc_short
-        shell: bash
-        env:
-          PREFIX: ${{ inputs.out_prefix || 'logo' }}
-        run: |
-          set -euo pipefail
-          python "${{ steps.tool.outputs.path }}" vuln "${INPUT_LOGO}" \
-            "${OUT_DIR}/${PREFIX}_vuln_alloc_short.bin" alloc_short
-
-      - name: Build vuln variant - shift_neg
-        shell: bash
-        env:
-          PREFIX: ${{ inputs.out_prefix || 'logo' }}
-        run: |
-          set -euo pipefail
-          python "${{ steps.tool.outputs.path }}" vuln "${INPUT_LOGO}" \
-            "${OUT_DIR}/${PREFIX}_vuln_shift_neg.bin" shift_neg
-
-      - name: Build vuln variant - div_zero
-        shell: bash
-        env:
-          PREFIX: ${{ inputs.out_prefix || 'logo' }}
-        run: |
-          set -euo pipefail
-          python "${{ steps.tool.outputs.path }}" vuln "${INPUT_LOGO}" \
-            "${OUT_DIR}/${PREFIX}_vuln_div_zero.bin" div_zero
-
-      - name: Build vuln variant - huge_wh
-        shell: bash
-        env:
-          PREFIX: ${{ inputs.out_prefix || 'logo' }}
-        run: |
-          set -euo pipefail
-          python "${{ steps.tool.outputs.path }}" vuln "${INPUT_LOGO}" \
-            "${OUT_DIR}/${PREFIX}_vuln_huge_wh.bin" huge_wh
-
-      - name: Analyze each variant
-        shell: bash
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-          for f in "${OUT_DIR}"/*_vuln_*.bin "${OUT_DIR}"/*_safe.bin; do
-            name=$(basename "${f}" .bin)
-            {
-              echo "===== ${name} ====="
-              python "${{ steps.tool.outputs.path }}" analyze "${f}"
-              echo
-            } >> "${OUT_DIR}/analyze_variants.txt"
-          done
-          tail -80 "${OUT_DIR}/analyze_variants.txt"
-
-      - name: Inventory + SHA256
+      - name: inventory
         shell: bash
         run: |
           set -euo pipefail
           ls -l "${OUT_DIR}"
-          sha256sum "${OUT_DIR}"/*.bin \
-            | tee "${OUT_DIR}/SHA256SUMS.txt"
+          sha256sum "${OUT_DIR}"/*.bin > "${OUT_DIR}/SHA256SUMS.txt"
+          cat "${OUT_DIR}/SHA256SUMS.txt"
 
-      - name: Job summary
+      - name: summary
         shell: bash
         run: |
           set -euo pipefail
           {
-            echo "### MTK logo PoC build"
+            echo "### MTK logo PoC artifacts"
             echo
-            echo "| file | size | sha256 (first 16) |"
+            echo "| file | size | sha256[0:16] |"
             echo "|---|---|---|"
             for f in "${OUT_DIR}"/*.bin; do
               s=$(stat -c%s "${f}")
               h=$(sha256sum "${f}" | cut -c1-16)
               echo "| $(basename "${f}") | ${s} | ${h} |"
             done
-            echo
-            echo "Detected images: ${{ steps.analyze.outputs.image_count }}"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: logo-poc
           path: |
             ${{ env.OUT_DIR }}/*.bin
             ${{ env.OUT_DIR }}/SHA256SUMS.txt
-            ${{ env.OUT_DIR }}/analyze.txt
-            ${{ env.OUT_DIR }}/analyze_variants.txt
-            ${{ env.OUT_DIR }}/dump.txt
+            ${{ env.OUT_DIR }}/info.txt
+            ${{ env.OUT_DIR }}/data_hex.txt
+            ${{ env.OUT_DIR }}/data_bmp_check.txt
             ${{ env.INPUT_LOGO }}.sha256
           retention-days: 30
           if-no-files-found: error

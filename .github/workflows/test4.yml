@@ -21,6 +21,15 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Inspect provided sd_boot.img
+        run: |
+          if [ -f sd_boot.img ]; then
+            echo "size=$(stat -c%s sd_boot.img)"
+            xxd -l 32 sd_boot.img || hexdump -C -n 32 sd_boot.img
+          else
+            echo "sd_boot.img not present; poc will synthesize mode0"
+          fi
+
       - name: Run PoC
         run: python3 poc.py
 
